@@ -1,0 +1,8 @@
+{
+  "name": "Best Day AI Training Helper Update 2-19-26- Functional",
+  "description": "An AI-powered video recording and analysis tool for personal trainers to track client sessions, count reps, extract coaching cues, and manage training protocols.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
