@@ -11,6 +11,8 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const isStartingRef = useRef(false);
   const streamRef = useRef<MediaStream | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isProcessingUpload, setIsProcessingUpload] = useState(false);
   
   const [recording, setRecording] = useState(false);
   const [clientName, setClientName] = useState('');
@@ -207,6 +209,56 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
     }
   }, [stream, mode]);
 
+  const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsProcessingUpload(true);
+    try {
+      const videoEl = document.createElement('video');
+      const url = URL.createObjectURL(file);
+      videoEl.src = url;
+      videoEl.muted = true;
+      videoEl.crossOrigin = 'anonymous';
+
+      await new Promise<void>((resolve, reject) => {
+        videoEl.onloadedmetadata = () => resolve();
+        videoEl.onerror = () => reject(new Error('Could not load video file'));
+        setTimeout(() => reject(new Error('Video load timed out')), 15000);
+      });
+
+      const duration = Math.round(videoEl.duration) || 1;
+      const uploadedSnapshots: string[] = [];
+      const snapshotCount = Math.min(12, Math.max(3, Math.floor(duration / 5)));
+
+      for (let i = 0; i < snapshotCount; i++) {
+        const seekTime = (duration / snapshotCount) * i + 0.1;
+        await new Promise<void>((resolve) => {
+          videoEl.currentTime = seekTime;
+          videoEl.onseeked = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 320;
+            canvas.height = 180;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(videoEl, 0, 0, 320, 180);
+              const base64 = canvas.toDataURL('image/jpeg', 0.4).split(',')[1];
+              uploadedSnapshots.push(base64);
+            }
+            resolve();
+          };
+        });
+      }
+
+      URL.revokeObjectURL(url);
+      onSessionComplete(file, clientName || 'Client', mode, uploadedSnapshots, duration);
+    } catch (err: any) {
+      setError('Upload failed: ' + (err.message || 'Unknown error'));
+    } finally {
+      setIsProcessingUpload(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }, [clientName, mode, onSessionComplete]);
+
   const formatTime = (s: number) => {
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
@@ -216,6 +268,13 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
 
   return (
     <div className="max-w-4xl mx-auto bg-white rounded-3xl shadow-2xl overflow-hidden border border-slate-200">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="video/*"
+        className="hidden"
+        onChange={handleFileUpload}
+      />
       <div className="bg-slate-900 p-6 flex items-center justify-between text-white">
         <div>
           <h2 className="font-black text-sm uppercase tracking-widest text-brand-400 italic">
@@ -243,11 +302,18 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
             <p className="text-slate-400 text-xs font-medium max-w-xs mx-auto">
               To start recording, we need access to your camera and microphone.
             </p>
-            <button 
+            <button
               onClick={() => startCamera(facingMode)}
               className="mt-4 px-8 py-3 bg-brand-500 text-white font-black uppercase tracking-widest text-xs rounded-xl shadow-lg shadow-brand-500/30 hover:bg-brand-400 transition-all active:scale-95"
             >
               Activate Camera
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isProcessingUpload}
+              className="mt-2 px-8 py-3 bg-slate-700 text-white font-black uppercase tracking-widest text-xs rounded-xl hover:bg-slate-600 transition-all active:scale-95 disabled:opacity-50"
+            >
+              {isProcessingUpload ? 'Processing…' : 'Upload Video'}
             </button>
           </div>
         )}
@@ -342,16 +408,25 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
         
         <div className="flex gap-4">
           {!recording ? (
-            <button 
-              onClick={startRecording} 
-              disabled={!!error || !stream} 
-              className="flex-1 bg-brand-500 text-white font-black py-5 rounded-2xl shadow-xl shadow-brand-100 hover:bg-brand-600 active:scale-95 transition-all uppercase text-xs tracking-[0.2em] disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Start Recording
-            </button>
+            <>
+              <button
+                onClick={startRecording}
+                disabled={!!error || !stream}
+                className="flex-1 bg-brand-500 text-white font-black py-5 rounded-2xl shadow-xl shadow-brand-100 hover:bg-brand-600 active:scale-95 transition-all uppercase text-xs tracking-[0.2em] disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Start Recording
+              </button>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isProcessingUpload || recording}
+                className="flex-1 bg-slate-800 text-white font-black py-5 rounded-2xl hover:bg-slate-700 active:scale-95 transition-all uppercase text-xs tracking-[0.2em] disabled:opacity-50"
+              >
+                {isProcessingUpload ? 'Processing…' : 'Upload Video'}
+              </button>
+            </>
           ) : (
-            <button 
-              onClick={() => { mediaRecorderRef.current?.stop(); setRecording(false); }} 
+            <button
+              onClick={() => { mediaRecorderRef.current?.stop(); setRecording(false); }}
               className="flex-1 bg-slate-900 text-white font-black py-5 rounded-2xl active:scale-95 transition-all uppercase text-xs tracking-[0.2em] shadow-xl shadow-slate-200"
             >
               End Session

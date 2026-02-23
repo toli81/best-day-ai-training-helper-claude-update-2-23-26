@@ -13,7 +13,7 @@ function getAI(): GoogleGenAI {
   return _ai;
 }
 
-const FLASH_MODEL = 'gemini-3-flash-preview';
+const FLASH_MODEL = 'gemini-2.5-flash';
 
 // Define schema before usage in functions
 const SESSION_SCHEMA = {
@@ -56,12 +56,20 @@ async function delay(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** Rejects the given promise if it doesn't settle within `ms` milliseconds. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label = 'Request'): Promise<T> {
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+}
+
 /**
  * High-Precision analysis for short video clips (< 5 mins)
  */
 export async function analyzeVideoClip(videoBase64: string, mimeType: string, retryCount = 0): Promise<SessionAnalysis> {
   try {
-    const response: GenerateContentResponse = await getAI().models.generateContent({
+    const apiCall = getAI().models.generateContent({
       model: FLASH_MODEL,
       contents: {
         parts: [
@@ -75,11 +83,11 @@ export async function analyzeVideoClip(videoBase64: string, mimeType: string, re
       }
     });
 
-    // Directly access text property
+    const response: GenerateContentResponse = await withTimeout(apiCall, 90_000, 'Video analysis');
     return processAiResponse(response.text);
   } catch (err: any) {
-    // If it's a size error or network error, we want App.tsx to catch it and use snapshots
-    console.error("Video Upload Error:", err);
+    // If it's a size error, timeout, or network error, App.tsx will catch and use snapshots
+    console.error("Video analysis error:", err);
     throw err;
   }
 }
@@ -98,7 +106,7 @@ export async function analyzeSnapshotAudit(snapshots: string[], isHighPrecision 
     : "Analyze this workout session sequence. Provide a chronological list of exercises, intensity summary, trainer cues, a full transcript, and body part emphasis percentages. Return as JSON.";
 
   try {
-    const response: GenerateContentResponse = await getAI().models.generateContent({
+    const apiCall = getAI().models.generateContent({
       model: FLASH_MODEL,
       contents: {
         parts: [
@@ -112,11 +120,11 @@ export async function analyzeSnapshotAudit(snapshots: string[], isHighPrecision 
       }
     });
 
-    // Directly access text property
+    const response: GenerateContentResponse = await withTimeout(apiCall, 60_000, 'Snapshot audit');
     return processAiResponse(response.text);
   } catch (err: any) {
-    console.error("Audit Error:", err);
-    throw new Error("Analysis failed. This usually happens if the mobile signal is completely lost.");
+    console.error("Audit error:", err);
+    throw new Error(`Snapshot analysis failed: ${err.message || 'Unknown error'}`);
   }
 }
 

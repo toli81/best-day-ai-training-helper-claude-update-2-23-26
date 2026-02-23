@@ -3,10 +3,19 @@ const DB_NAME = 'BestDayTrainingDB';
 const STORE_NAME = 'videos';
 const DB_VERSION = 1;
 
-export async function initDB(): Promise<IDBDatabase> {
+function deleteDB(): Promise<void> {
+  return new Promise((resolve) => {
+    const req = indexedDB.deleteDatabase(DB_NAME);
+    req.onsuccess = () => resolve();
+    req.onerror = () => resolve(); // resolve anyway so we can attempt a fresh open
+    req.onblocked = () => resolve();
+  });
+}
+
+function openDBInternal(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = () => reject(new Error(request.error?.message || 'Failed to open IndexedDB'));
+    request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB'));
     request.onsuccess = () => resolve(request.result);
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
@@ -15,6 +24,21 @@ export async function initDB(): Promise<IDBDatabase> {
       }
     };
   });
+}
+
+export async function initDB(): Promise<IDBDatabase> {
+  try {
+    return await openDBInternal();
+  } catch (err: any) {
+    if (err?.name === 'VersionError') {
+      // Stored DB is at a higher version than requested (leftover from a previous build).
+      // Safe to wipe it — local blobs are just a cache; the source of truth is GCS/Firestore.
+      console.warn('[IndexedDB] Version mismatch — deleting stale database and recreating at v1.');
+      await deleteDB();
+      return openDBInternal();
+    }
+    throw new Error(err?.message || 'Failed to open IndexedDB');
+  }
 }
 
 export async function saveVideo(id: string, blob: Blob): Promise<void> {

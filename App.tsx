@@ -5,49 +5,51 @@ import ExerciseLibrary from './components/ExerciseLibrary';
 import { TrainingSession, ViewState, SessionMode, Exercise, SessionAnalysis } from './types';
 import { analyzeVideoClip, analyzeSnapshotAudit, blobToBase64 } from './services/geminiService';
 import { saveVideo, getVideo, deleteVideo, getAllSessionIds } from './services/storageService';
-import { initDrive, authenticateDrive, uploadSessionToDrive } from './services/googleDriveService';
+import { useAuth } from './hooks/useAuth';
+import { useFirestoreSessions } from './hooks/useFirestoreSessions';
+import { saveSession, updateSession, deleteSession as deleteFirestoreSession, ensureClient } from './services/firestoreService';
+import { enqueue as enqueueSyncTask, init as initSyncService, registerCallbacks } from './services/syncService';
+import { hasLocalData } from './services/migrationService';
+import MigrationDialog from './components/MigrationDialog';
 
 const App: React.FC = () => {
+  const { user } = useAuth();
+  const trainerId = user?.uid;
+
   const [view, setView] = useState<ViewState>('dashboard');
-  const [sessions, setSessions] = useState<TrainingSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingExerciseJump, setPendingExerciseJump] = useState<Exercise | null>(null);
   const [storageInfo, setStorageInfo] = useState<{ used: number; total: number; percent: number } | null>(null);
-  
-  // Drive State
-  const [isDriveReady, setIsDriveReady] = useState(false);
-  const [driveAuthenticated, setDriveAuthenticated] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
 
   // Selection state for bulk actions
   const [isManageMode, setIsManageMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
-  
+
   // Transcription toggles for dashboard
   const [expandedTranscripts, setExpandedTranscripts] = useState<Record<string, boolean>>({});
-  
+
   // Local state for editing exercise names within the details view
   const [editingExerciseId, setEditingExerciseId] = useState<string | null>(null);
   const [tempExerciseName, setTempExerciseName] = useState('');
-  
+
   const videoPlayerRef = useRef<HTMLVideoElement>(null);
 
-  useEffect(() => {
-    initDrive().then(() => setIsDriveReady(true)).catch(console.error);
-  }, []);
+  // Firestore real-time sessions (replaces localStorage)
+  const { sessions: firestoreSessions, loading: sessionsLoading } = useFirestoreSessions(trainerId);
 
-  const handleDriveConnect = async () => {
-    try {
-      await authenticateDrive();
-      setDriveAuthenticated(true);
-      alert("Google Drive Connected! Future sessions will sync to folder 'Best Day App Data'.");
-    } catch (e: any) {
-      console.error(e);
-      alert("Failed to connect Google Drive.");
+  // Local override for optimistic UI (set briefly during saves, cleared by Firestore listener)
+  const [localSessions, setLocalSessions] = useState<TrainingSession[] | null>(null);
+  const sessions = localSessions ?? firestoreSessions;
+  const setSessions = setLocalSessions;
+
+  // Clear local overrides when Firestore catches up
+  useEffect(() => {
+    if (firestoreSessions.length > 0 || !sessionsLoading) {
+      setLocalSessions(null);
     }
-  };
+  }, [firestoreSessions, sessionsLoading]);
 
   const updateStorageEstimate = useCallback(async () => {
     if (navigator.storage && navigator.storage.estimate) {
@@ -61,43 +63,44 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const loadLocalSessions = useCallback(async () => {
-    const saved = localStorage.getItem('bt_sessions');
-    if (!saved) return;
-
-    try {
-      const parsed: TrainingSession[] = JSON.parse(saved);
-      const hydrated = await Promise.all(parsed.map(async (session) => {
-        try {
-          const blob = await getVideo(session.id);
-          if (blob) {
-            return { ...session, videoUrl: URL.createObjectURL(blob) };
-          }
-        } catch (e: any) {
-          console.error(`Failed to load video for session ${session.id}`, e);
-        }
-        return session;
-      }));
-      
-      setSessions(hydrated.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()));
-    } catch (e: any) {
-      console.error("Failed to parse local sessions:", e);
-    }
-  }, []);
-
   useEffect(() => {
-    loadLocalSessions();
     updateStorageEstimate();
-    const interval = setInterval(updateStorageEstimate, 30000); // Check storage every 30s
+    const interval = setInterval(updateStorageEstimate, 30000);
     return () => clearInterval(interval);
-  }, [loadLocalSessions, updateStorageEstimate]);
+  }, [updateStorageEstimate]);
 
+  // Upload progress state: sessionId -> percent (0-100) or 'synced'/'failed'
+  const [uploadProgress, setUploadProgress] = useState<Record<string, number | 'synced' | 'failed'>>({});
+
+  // Migration dialog: show once on first login if local data exists
+  const [showMigration, setShowMigration] = useState(false);
   useEffect(() => {
-    const stripped = sessions.map(({ videoUrl, videoBlob, ...s }) => s);
-    localStorage.setItem('bt_sessions', JSON.stringify(stripped));
-  }, [sessions]);
+    if (trainerId && hasLocalData() && firestoreSessions.length === 0 && !sessionsLoading) {
+      setShowMigration(true);
+    }
+  }, [trainerId, firestoreSessions.length, sessionsLoading]);
 
-  // Rescue Utility
+  // Init sync service on trainer login
+  useEffect(() => {
+    if (!trainerId) return;
+    registerCallbacks(
+      (sessionId, percent) => setUploadProgress(prev => ({ ...prev, [sessionId]: percent })),
+      (sessionId, status) => {
+        setUploadProgress(prev => ({ ...prev, [sessionId]: status }));
+        if (status === 'synced') {
+          // clean up progress indicator after a short delay
+          setTimeout(() => setUploadProgress(prev => {
+            const next = { ...prev };
+            delete next[sessionId];
+            return next;
+          }), 3000);
+        }
+      }
+    );
+    initSyncService(trainerId).catch(console.error);
+  }, [trainerId]);
+
+  // Rescue Utility: find local videos not tracked in Firestore
   const rescueOrphanedSessions = async () => {
     try {
       const allIds = await getAllSessionIds();
@@ -105,15 +108,16 @@ const App: React.FC = () => {
       const orphans = allIds.filter(id => !manifestIds.has(id));
 
       if (orphans.length === 0) {
-        alert("No orphaned sessions found. Your manifest is in sync.");
+        alert("No orphaned sessions found. Your data is in sync.");
         return;
       }
 
-      if (window.confirm(`Found ${orphans.length} video(s) that are missing from your list. Would you like to restore them? Note: AI analysis might be missing.`)) {
+      if (window.confirm(`Found ${orphans.length} video(s) not in your session list. Restore them?`)) {
         const rescued: TrainingSession[] = await Promise.all(orphans.map(async (id) => {
           const blob = await getVideo(id);
-          return {
+          const s: TrainingSession = {
             id,
+            trainerId: trainerId || undefined,
             clientName: 'Rescued Client',
             date: new Date(parseInt(id.split('-')[1]) || Date.now()).toISOString(),
             duration: 0,
@@ -121,10 +125,13 @@ const App: React.FC = () => {
             videoUrl: blob ? URL.createObjectURL(blob) : undefined,
             mode: 'clip',
             status: 'failed',
+            syncStatus: 'local',
             error: 'Session was recovered from deep storage. AI analysis missing.'
           };
+          if (trainerId) await saveSession(trainerId, s).catch(console.error);
+          return s;
         }));
-        setSessions(prev => [...rescued, ...prev]);
+        setSessions([...rescued, ...sessions]);
         updateStorageEstimate();
       }
     } catch (e: any) {
@@ -152,76 +159,63 @@ const App: React.FC = () => {
     }
   }, [view, pendingExerciseJump]);
 
-  const syncToDrive = async (session: TrainingSession, blob: Blob) => {
-    if (!driveAuthenticated) return;
-    try {
-        setIsSyncing(true);
-        const folderId = await uploadSessionToDrive(blob, session.analysis, session.clientName, session.date);
-        
-        setSessions(prev => prev.map(s => s.id === session.id ? {
-            ...s,
-            driveSync: {
-                status: 'synced',
-                folderLink: folderId,
-                lastAttempt: new Date().toISOString()
-            }
-        } : s));
-    } catch (e: any) {
-      console.error("Sync failed", e);
-      const errorMsg = e.message || (typeof e === 'string' ? e : JSON.stringify(e)) || "Unknown sync error";
-      setSessions(prev => prev.map(s => s.id === session.id ? {
-          ...s,
-          driveSync: {
-              status: 'failed',
-              lastAttempt: new Date().toISOString()
-          }
-      } : s));
-    } finally {
-        setIsSyncing(false);
-    }
-  };
-
   const performAnalysis = async (session: TrainingSession, blob: Blob, snapshots: string[]) => {
     try {
       let analysis: SessionAnalysis;
       const fileSizeMB = blob.size / (1024 * 1024);
+      console.log(`[Analysis] Starting — mode: ${session.mode}, size: ${fileSizeMB.toFixed(1)} MB, snapshots: ${snapshots.length}`);
 
-      if (session.mode === 'clip' && fileSizeMB < 18) {
+      // If we have pre-extracted snapshots (e.g. uploaded video), skip the slow
+      // full-video base64 encoding and go straight to snapshot analysis.
+      if (snapshots.length >= 3) {
+        console.log('[Analysis] Using pre-extracted snapshots…');
+        analysis = await analyzeSnapshotAudit(snapshots, session.mode === 'clip');
+        console.log('[Analysis] Snapshot audit complete');
+      } else if (session.mode === 'clip' && fileSizeMB < 18) {
         try {
+          console.log('[Analysis] Encoding video to base64…');
           const base64 = await blobToBase64(blob);
+          console.log('[Analysis] Base64 done, calling Gemini video analysis…');
           analysis = await analyzeVideoClip(base64, blob.type);
+          console.log('[Analysis] Video analysis complete');
         } catch (e: any) {
+          console.warn('[Analysis] Video analysis failed, falling back to snapshots:', e.message);
           analysis = await analyzeSnapshotAudit(snapshots, true);
+          console.log('[Analysis] Snapshot fallback complete');
         }
       } else {
+        console.log('[Analysis] Using snapshot audit path…');
         analysis = await analyzeSnapshotAudit(snapshots, session.mode === 'clip');
+        console.log('[Analysis] Snapshot audit complete');
       }
 
-      setSessions(prev => prev.map(s => s.id === session.id ? {
-        ...s,
+      const updatedFields = {
         analysis,
-        status: 'complete',
+        status: 'complete' as const,
         tags: Array.from(new Set(analysis.exercises.flatMap(ex => ex.tags)))
-      } : s));
+      };
 
-      // Trigger Drive Sync (Background)
-      if (driveAuthenticated) {
-        // We pass the updated session with analysis
-        const updatedSession = { ...session, analysis };
-        syncToDrive(updatedSession, blob);
+      // Update local UI immediately — don't await Firestore so it can't block the loading state
+      setSessions(prev => prev ? prev.map(s => s.id === session.id ? { ...s, ...updatedFields } : s) : prev);
+
+      // Firestore write is fire-and-forget
+      if (trainerId) {
+        updateSession(trainerId, session.id, updatedFields).catch(console.error);
       }
 
     } catch (err: any) {
       console.error("Analysis background error:", err);
       const errorMsg = err.message || (typeof err === 'string' ? err : JSON.stringify(err)) || "AI analysis failed";
-      setSessions(prev => prev.map(s => s.id === session.id ? {
-        ...s,
-        status: 'failed',
-        error: errorMsg
-      } : s));
-      
-      // Still attempt sync even if analysis fails
-      if (driveAuthenticated) syncToDrive(session, blob);
+
+      const failedFields = { status: 'failed' as const, error: errorMsg };
+
+      // Update local UI immediately — don't await Firestore so it can't block the loading state
+      setSessions(prev => prev ? prev.map(s => s.id === session.id ? { ...s, ...failedFields } : s) : prev);
+
+      // Firestore write is fire-and-forget
+      if (trainerId) {
+        updateSession(trainerId, session.id, failedFields).catch(console.error);
+      }
     }
   };
 
@@ -229,14 +223,14 @@ const App: React.FC = () => {
     setIsAnalyzing(true);
     setError(null);
     const sessionId = `sess-${Date.now()}`;
-    
+
     try {
-      await saveVideo(sessionId, blob);
-      await updateStorageEstimate();
+      const resolvedClientName = clientName || 'Client';
 
       const newSession: TrainingSession = {
         id: sessionId,
-        clientName: clientName || 'Client',
+        trainerId: trainerId || undefined,
+        clientName: resolvedClientName,
         date: new Date().toISOString(),
         duration,
         tags: [],
@@ -244,15 +238,28 @@ const App: React.FC = () => {
         snapshotCount: snapshots.length,
         mode,
         status: 'processing',
-        driveSync: { status: 'pending' }
+        syncStatus: 'local',
       };
 
-      setSessions(prev => [newSession, ...prev]);
+      // Update UI immediately — nothing blocks the dashboard from showing
+      setSessions(prev => [newSession, ...(prev || [])]);
       setView('dashboard');
 
-      // Run analysis
-      await performAnalysis(newSession, blob, snapshots);
-      
+      // All storage/network writes are fire-and-forget
+      saveVideo(sessionId, blob).catch(console.error);
+      updateStorageEstimate().catch(console.error);
+      if (trainerId) {
+        saveSession(trainerId, newSession).catch(console.error);
+        ensureClient(trainerId, resolvedClientName).catch(console.error);
+        enqueueSyncTask(trainerId, sessionId, sessionId).catch(console.error);
+      }
+
+      // Run AI analysis — hard 70s safety net so loading ALWAYS clears
+      await Promise.race([
+        performAnalysis(newSession, blob, snapshots),
+        new Promise<void>(resolve => setTimeout(resolve, 70_000))
+      ]);
+
     } catch (err: any) {
       console.error("Critical session save error:", err);
       const errorMsg = err.message || (typeof err === 'string' ? err : JSON.stringify(err)) || "Failed to save video";
@@ -265,19 +272,22 @@ const App: React.FC = () => {
   const handleRetryAnalysis = async (session: TrainingSession) => {
     const blob = await getVideo(session.id);
     if (!blob) {
-      alert("Video file missing from storage.");
+      alert("Video file missing from local storage. Cannot retry analysis.");
       return;
     }
-
-    setSessions(prev => prev.map(s => s.id === session.id ? { ...s, status: 'processing', error: undefined } : s));
-    await performAnalysis(session, blob, []); 
+    const retryFields = { status: 'processing' as const, error: undefined };
+    setSessions(sessions.map(s => s.id === session.id ? { ...s, ...retryFields } : s));
+    if (trainerId) updateSession(trainerId, session.id, retryFields).catch(console.error);
+    await performAnalysis(session, blob, []);
   };
 
   const handleDelete = async (id: string) => {
     if (window.confirm('Delete this session permanently? This removes all associated videos and technical data.')) {
       await deleteVideo(id);
-      const remaining = sessions.filter(s => s.id !== id);
-      setSessions(remaining);
+      if (trainerId) {
+        await deleteFirestoreSession(trainerId, id).catch(console.error);
+      }
+      setSessions(prev => prev ? prev.filter(s => s.id !== id) : prev);
       if (currentSessionId === id) setView('dashboard');
       setSelectedSessionIds(prev => {
         const next = new Set(prev);
@@ -292,8 +302,13 @@ const App: React.FC = () => {
     const count = selectedSessionIds.size;
     if (window.confirm(`Delete ${count} sessions permanently? This action cannot be undone.`)) {
       const idsToDelete: string[] = Array.from(selectedSessionIds);
-      await Promise.all(idsToDelete.map(id => deleteVideo(id)));
-      setSessions(prev => prev.filter(s => !selectedSessionIds.has(s.id)));
+      await Promise.all(idsToDelete.map(async (id) => {
+        await deleteVideo(id);
+        if (trainerId) {
+          await deleteFirestoreSession(trainerId, id).catch(console.error);
+        }
+      }));
+      setSessions(prev => prev ? prev.filter(s => !selectedSessionIds.has(s.id)) : prev);
       setSelectedSessionIds(new Set());
       setIsManageMode(false);
       if (currentSessionId && selectedSessionIds.has(currentSessionId)) {
@@ -339,7 +354,7 @@ const App: React.FC = () => {
   };
 
   const handleUpdateGlobalTag = (oldTag: string, newTag: string) => {
-    setSessions(prev => prev.map(session => ({
+    const updated = (firestoreSessions.length > 0 ? firestoreSessions : (localSessions || [])).map(session => ({
       ...session,
       tags: Array.from(new Set(session.tags.map(t => t === oldTag ? newTag : t))),
       analysis: session.analysis ? {
@@ -349,11 +364,15 @@ const App: React.FC = () => {
           tags: Array.from(new Set(ex.tags.map(t => t === oldTag ? newTag : t)))
         }))
       } : session.analysis
-    })));
+    }));
+    setSessions(updated);
+    if (trainerId) {
+      updated.forEach(s => updateSession(trainerId, s.id, { tags: s.tags, analysis: s.analysis }).catch(console.error));
+    }
   };
 
   const handleDeleteGlobalTag = (tagToDelete: string) => {
-    setSessions(prev => prev.map(session => ({
+    const updated = (firestoreSessions.length > 0 ? firestoreSessions : (localSessions || [])).map(session => ({
       ...session,
       tags: session.tags.filter(t => t !== tagToDelete),
       analysis: session.analysis ? {
@@ -363,11 +382,16 @@ const App: React.FC = () => {
           tags: ex.tags.filter(t => t !== tagToDelete)
         }))
       } : session.analysis
-    })));
+    }));
+    setSessions(updated);
+    if (trainerId) {
+      updated.forEach(s => updateSession(trainerId, s.id, { tags: s.tags, analysis: s.analysis }).catch(console.error));
+    }
   };
 
   const handleAddTagToExercise = (sessionId: string, exerciseId: string, tag: string) => {
-    setSessions(prev => prev.map(session => {
+    const allSessions = firestoreSessions.length > 0 ? firestoreSessions : (localSessions || []);
+    const updated = allSessions.map(session => {
       if (session.id !== sessionId) return session;
       return {
         ...session,
@@ -380,11 +404,17 @@ const App: React.FC = () => {
           })
         } : session.analysis
       };
-    }));
+    });
+    setSessions(updated);
+    const changed = updated.find(s => s.id === sessionId);
+    if (trainerId && changed) {
+      updateSession(trainerId, sessionId, { tags: changed.tags, analysis: changed.analysis }).catch(console.error);
+    }
   };
 
   const handleRemoveTagFromExercise = (sessionId: string, exerciseId: string, tagToRemove: string) => {
-    setSessions(prev => prev.map(session => {
+    const allSessions = firestoreSessions.length > 0 ? firestoreSessions : (localSessions || []);
+    const updated = allSessions.map(session => {
       if (session.id !== sessionId) return session;
       const updatedExercises = session.analysis?.exercises.map(ex => {
         if (ex.id !== exerciseId) return ex;
@@ -394,16 +424,19 @@ const App: React.FC = () => {
       return {
         ...session,
         tags: allNewExerciseTags,
-        analysis: session.analysis ? {
-          ...session.analysis,
-          exercises: updatedExercises || []
-        } : session.analysis
+        analysis: session.analysis ? { ...session.analysis, exercises: updatedExercises || [] } : session.analysis
       };
-    }));
+    });
+    setSessions(updated);
+    const changed = updated.find(s => s.id === sessionId);
+    if (trainerId && changed) {
+      updateSession(trainerId, sessionId, { tags: changed.tags, analysis: changed.analysis }).catch(console.error);
+    }
   };
 
   const handleUpdateExerciseName = (sessionId: string, exerciseId: string, newName: string) => {
-    setSessions(prev => prev.map(session => {
+    const allSessions = firestoreSessions.length > 0 ? firestoreSessions : (localSessions || []);
+    const updated = allSessions.map(session => {
       if (session.id !== sessionId) return session;
       return {
         ...session,
@@ -415,7 +448,12 @@ const App: React.FC = () => {
           })
         } : session.analysis
       };
-    }));
+    });
+    setSessions(updated);
+    const changed = updated.find(s => s.id === sessionId);
+    if (trainerId && changed) {
+      updateSession(trainerId, sessionId, { analysis: changed.analysis }).catch(console.error);
+    }
   };
 
   const formatDuration = (s: number) => {
@@ -489,6 +527,15 @@ const App: React.FC = () => {
 
   return (
     <Layout activeTab={view} onNavigate={setView}>
+      {/* Migration dialog for first-time cloud login with existing local data */}
+      {showMigration && trainerId && (
+        <MigrationDialog
+          trainerId={trainerId}
+          onComplete={() => setShowMigration(false)}
+          onSkip={() => setShowMigration(false)}
+        />
+      )}
+
       {view === 'recorder' && (
         <div className="space-y-6">
           <button 
@@ -534,21 +581,12 @@ const App: React.FC = () => {
                   </div>
                 )}
                 <div className="h-8 w-px bg-slate-200 mx-2 hidden md:block"></div>
-                {isDriveReady && !driveAuthenticated && (
-                  <button 
-                    onClick={handleDriveConnect}
-                    className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-600 hover:text-slate-900 hover:border-slate-300 transition-colors"
-                  >
-                    <img src="https://upload.wikimedia.org/wikipedia/commons/1/12/Google_Drive_icon_%282020%29.svg" className="w-4 h-4" alt="Drive" />
-                    <span className="text-[10px] font-black uppercase tracking-widest">Connect Drive</span>
-                  </button>
-                )}
-                {driveAuthenticated && (
-                  <div className="flex items-center gap-2 text-green-600 px-3 py-1.5 bg-green-50 rounded-lg border border-green-100">
-                     <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></div>
-                     <span className="text-[9px] font-black uppercase tracking-widest">Drive Synced</span>
-                  </div>
-                )}
+                <div className="flex items-center gap-2 text-green-600 px-3 py-1.5 bg-green-50 rounded-lg border border-green-100">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"/>
+                  </svg>
+                  <span className="text-[9px] font-black uppercase tracking-widest">Cloud Synced</span>
+                </div>
               </div>
             </div>
             
@@ -594,18 +632,12 @@ const App: React.FC = () => {
                   </svg>
                </div>
                <div>
-                 <div className="text-brand-500 font-black uppercase tracking-widest text-xs mb-1">Gemini AI Background Audit</div>
-                 <div className="text-slate-400 text-[10px] font-bold uppercase tracking-tight">Extracting biomechanical cues & rep counts</div>
+                 <div className="text-brand-500 font-black uppercase tracking-widest text-xs mb-1">Gemini AI Analysis</div>
+                 <div className="text-slate-400 text-[10px] font-bold uppercase tracking-tight">Analyzing session — auto-clears in 70s</div>
                </div>
             </div>
           )}
 
-          {isSyncing && (
-             <div className="fixed top-4 right-4 bg-slate-900 text-white px-6 py-3 rounded-full shadow-2xl z-50 flex items-center gap-3 animate-in slide-in-from-top-10">
-                <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-                <span className="text-[10px] font-black uppercase tracking-widest">Syncing to Drive...</span>
-             </div>
-          )}
 
           {sessions.length === 0 && !isAnalyzing ? (
             <div className="bg-white border-2 border-dashed border-slate-200 p-20 rounded-[40px] text-center">
@@ -670,6 +702,22 @@ const App: React.FC = () => {
                              </span>
                           </div>
 
+                          {/* Cloud upload progress indicator */}
+                          {uploadProgress[session.id] !== undefined && uploadProgress[session.id] !== 'synced' && uploadProgress[session.id] !== 'failed' && (
+                            <div className="absolute bottom-0 left-0 right-0 bg-black/50 px-3 py-2">
+                              <div className="flex items-center gap-2">
+                                <div className="flex-grow h-1.5 bg-white/20 rounded-full overflow-hidden">
+                                  <div
+                                    className="h-full bg-brand-500 rounded-full transition-all duration-300"
+                                    style={{ width: `${uploadProgress[session.id]}%` }}
+                                  />
+                                </div>
+                                <span className="text-[8px] font-black text-white shrink-0">{uploadProgress[session.id]}%</span>
+                              </div>
+                              <span className="text-[7px] text-white/60 uppercase tracking-widest">Uploading to Cloud</span>
+                            </div>
+                          )}
+
                           {session.status === 'processing' && (
                              <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center">
                                 <div className="w-8 h-8 border-4 border-brand-500 border-t-transparent rounded-full animate-spin mb-3"></div>
@@ -703,9 +751,11 @@ const App: React.FC = () => {
                                 {session.mode}
                               </div>
                             </div>
-                            {session.driveSync?.status === 'synced' && (
-                                <div className="bg-green-50 p-1.5 rounded-lg border border-green-100" title="Saved to Drive">
-                                    <img src="https://upload.wikimedia.org/wikipedia/commons/1/12/Google_Drive_icon_%282020%29.svg" className="w-3 h-3 opacity-60 grayscale-0" alt="synced" />
+                            {session.syncStatus === 'synced' && (
+                                <div className="bg-green-50 p-1.5 rounded-lg border border-green-100" title="Saved to Cloud">
+                                  <svg className="w-3 h-3 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"/>
+                                  </svg>
                                 </div>
                             )}
                           </div>

@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(export PATH=\"$PATH:/c/Program Files/nodejs:/c/Users/chris/AppData/Roaming/npm\")",
+      "Bash(where:*)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(echo:*)",
+      "Bash(node:*)",
+      "Bash(done)",
+      "Bash(npm run dev:*)",
+      "Bash(firebase --version:*)",
+      "Bash(firebase projects:list:*)",
+      "Bash(firebase login:list:*)",
+      "Bash(firebase deploy:*)",
+      "Bash(nslookup:*)",
+      "Bash(NODE_OPTIONS=\"--dns-result-order=ipv4first\" firebase deploy --only firestore)",
+      "Bash(npm run build:*)",
+      "Bash(ls \"C:\\\\Users\\\\chris\\\\Downloads\\\\best-day-ai-training-helper-update-2-19-26--functional\\\\functions\"\" && echo \"---\" && cat \"C:UserschrisDownloadsbest-day-ai-training-helper-update-2-19-26--functionalfunctionspackage.json \")",
+      "Bash(firebase functions:config:set:*)",
+      "Bash(firebase functions:secrets:access:*)",
+      "Bash(gcloud storage buckets update:*)",
+      "Bash(taskkill:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(npm --version)",
+      "Bash(cmd //c \"where npm\")",
+      "Bash(cmd //c \"where npx\")",
+      "Bash(cmd //c \"where vite\")",
+      "Bash(ls:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
