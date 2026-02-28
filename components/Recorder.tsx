@@ -33,6 +33,7 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
   const [mode, setMode] = useState<SessionMode>('clip');
   const [snapshots, setSnapshots] = useState<string[]>([]);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
+  const [isSwitchingLens, setIsSwitchingLens] = useState(false);
 
   // Camera lens selection state
   const [availableCameras, setAvailableCameras] = useState<CameraDevice[]>([]);
@@ -56,7 +57,7 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
 
   const captureSnapshot = useCallback(() => {
     if (!videoRef.current || !recording) return;
-    
+
     const canvas = document.createElement('canvas');
     canvas.width = 320;
     canvas.height = 180;
@@ -74,31 +75,38 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
   useEffect(() => {
     let interval: any;
     let snapshotInterval: any;
-    
+
     if (recording) {
       interval = setInterval(() => setTimer(t => t + 1), 1000);
       const freq = mode === 'clip' ? 2000 : (mode === 'workout30' ? 5000 : 12000);
       snapshotInterval = setInterval(captureSnapshot, freq);
     }
-    
+
     return () => {
       clearInterval(interval);
       clearInterval(snapshotInterval);
     };
   }, [recording, captureSnapshot, mode]);
 
-  const stopCurrentStream = useCallback(() => {
-    if (stream) {
-      stream.getTracks().forEach(track => {
-        track.stop();
-      });
-      setStream(null);
+  // Helper: stop tracks directly via ref (avoids stale closure issues)
+  const stopTracksOnly = useCallback(() => {
+    const currentStream = streamRef.current;
+    if (currentStream) {
+      currentStream.getTracks().forEach(track => track.stop());
     }
+  }, []);
+
+  // Full stream stop (for unmounting scenarios)
+  const stopCurrentStream = useCallback(() => {
+    stopTracksOnly();
+    streamRef.current = null;
+    setStream(null);
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-  }, [stream]);
+  }, [stopTracksOnly]);
 
+  // Attach stream to video element whenever stream changes
   useEffect(() => {
     if (stream && videoRef.current) {
       videoRef.current.srcObject = stream;
@@ -222,103 +230,95 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
   }, []);
 
   const startCamera = async (facing: 'user' | 'environment', deviceId?: string) => {
-    if (isStartingRef.current) return;
+    if (isStartingRef.current) {
+      console.warn('startCamera called while already starting, ignoring');
+      return;
+    }
     isStartingRef.current = true;
     setError(null);
 
-    stopCurrentStream();
-
-    // Give the phone time to release the camera hardware before opening a new one
-    await new Promise(r => setTimeout(r, 300));
-
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setError("Your browser does not support camera access. Please use a modern browser like Chrome or Safari.");
-      isStartingRef.current = false;
-      return;
-    }
+    // If we already have a stream, this is a lens/camera switch — show switching indicator
+    const isSwitch = !!streamRef.current;
+    if (isSwitch) setIsSwitchingLens(true);
 
     try {
-      // Use "ideal" instead of "exact" — this tells the browser to PREFER this device
-      // but gracefully fall back if it can't open it, instead of hard-failing
-      const deviceConstraints: MediaTrackConstraints = deviceId
-        ? { deviceId: { ideal: deviceId } }
-        : { facingMode: { ideal: facing } };
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setError("Your browser does not support camera access. Please use a modern browser like Chrome or Safari.");
+        return;
+      }
 
-      const facingFallbackConstraints: MediaTrackConstraints = {
-        facingMode: { ideal: facing }
-      };
+      // Stop old tracks directly via ref (avoids stale closure issues with useCallback)
+      // DON'T set stream to null — keep the video element mounted during the switch
+      const oldStream = streamRef.current;
+      if (oldStream) {
+        oldStream.getTracks().forEach(t => t.stop());
+      }
 
-      const highResConstraints: MediaTrackConstraints = {
-        ...deviceConstraints,
+      // Brief delay for phone hardware to release camera
+      await new Promise(r => setTimeout(r, 250));
+
+      // Build constraints — use "exact" for deviceId to ensure we get the RIGHT camera,
+      // but with a proper fallback cascade that drops to facingMode if exact fails
+      const exactDeviceConstraints: MediaTrackConstraints | null = deviceId
+        ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        : null;
+
+      const facingConstraints: MediaTrackConstraints = {
+        facingMode: { ideal: facing },
         width: { ideal: 1280 },
         height: { ideal: 720 }
       };
 
-      let s;
-      try {
-        // Tier 1: high res with specific device + audio
-        s = await navigator.mediaDevices.getUserMedia({ video: highResConstraints, audio: true });
-      } catch (err: any) {
-        console.warn("Tier 1 failed (high-res + device + audio), trying basic device + audio...", err);
+      let s: MediaStream | null = null;
 
+      // When a specific device is requested, try exact first (so we get the right lens)
+      if (exactDeviceConstraints) {
         try {
-          // Tier 2: basic device constraints + audio
-          s = await navigator.mediaDevices.getUserMedia({ video: deviceConstraints, audio: true });
-        } catch (err2: any) {
-          console.warn("Tier 2 failed (device + audio), trying device without audio...", err2);
-
+          s = await navigator.mediaDevices.getUserMedia({ video: exactDeviceConstraints, audio: true });
+        } catch (e1: any) {
+          console.warn("Exact deviceId + audio failed, trying without audio...", e1);
           try {
-            // Tier 3: device constraints without audio
-            s = await navigator.mediaDevices.getUserMedia({ video: deviceConstraints, audio: false });
-            setError("Microphone access denied or failed. Recording video only.");
-          } catch (err3: any) {
-            console.warn("Tier 3 failed (device only), trying facingMode fallback...", err3);
+            s = await navigator.mediaDevices.getUserMedia({ video: exactDeviceConstraints, audio: false });
+          } catch (e2: any) {
+            console.warn("Exact deviceId failed entirely, falling back to facingMode...", e2);
+            s = null; // Will fall through to facingMode fallback below
+          }
+        }
+      }
 
+      // If no device requested OR exact deviceId failed, use facingMode
+      if (!s) {
+        try {
+          s = await navigator.mediaDevices.getUserMedia({ video: facingConstraints, audio: true });
+        } catch (e3: any) {
+          console.warn("FacingMode + audio failed, trying without audio...", e3);
+          try {
+            s = await navigator.mediaDevices.getUserMedia({ video: facingConstraints, audio: false });
+            setError("Microphone access denied. Recording video only.");
+          } catch (e4: any) {
+            console.warn("FacingMode failed, trying absolute fallback...", e4);
             try {
-              // Tier 4: drop deviceId entirely, just use facingMode + audio
-              s = await navigator.mediaDevices.getUserMedia({ video: facingFallbackConstraints, audio: true });
-              if (deviceId) {
-                console.warn("Specific camera unavailable, fell back to default rear camera");
-              }
-            } catch (err4: any) {
-              console.warn("Tier 4 failed (facingMode + audio), trying absolute fallback...", err4);
-
-              try {
-                // Tier 5: absolute fallback — no constraints at all
-                s = await navigator.mediaDevices.getUserMedia({ video: true });
-                setError("Could not access specific camera. Using default.");
-              } catch (err5: any) {
-                console.error("All camera attempts failed:", err5);
-                throw err5;
-              }
+              s = await navigator.mediaDevices.getUserMedia({ video: true });
+            } catch (e5: any) {
+              console.error("All camera attempts failed:", e5);
+              throw e5;
             }
           }
         }
       }
 
-      // Verify which camera we actually got (for deviceId requests)
-      if (deviceId && s) {
-        const activeTrack = s.getVideoTracks()[0];
-        const actualSettings = activeTrack?.getSettings?.();
-        if (actualSettings?.deviceId && actualSettings.deviceId === deviceId) {
-          // Successfully got the requested camera
-          setSelectedCameraId(deviceId);
-        } else if (actualSettings?.deviceId) {
-          // Browser gave us a different camera — update selection to match reality
-          console.warn(`Requested device ${deviceId} but got ${actualSettings.deviceId}`);
-          setSelectedCameraId(actualSettings.deviceId);
-        }
-      }
-
+      // Update stream ref immediately (before React re-render) to prevent stale refs
+      streamRef.current = s;
       setStream(s);
       setFacingMode(facing);
-      if (!deviceId) {
-        // If no specific device requested, detect which device we got
-        const activeTrack = s.getVideoTracks()[0];
-        const actualSettings = activeTrack?.getSettings?.();
-        if (actualSettings?.deviceId) {
-          setSelectedCameraId(actualSettings.deviceId);
-        }
+
+      // Detect which camera we actually got and update the active lens indicator
+      const activeTrack = s.getVideoTracks()[0];
+      const actualSettings = activeTrack?.getSettings?.();
+      if (actualSettings?.deviceId) {
+        setSelectedCameraId(actualSettings.deviceId);
+      } else if (deviceId) {
+        setSelectedCameraId(deviceId);
       }
 
       // After first successful camera access, enumerate and classify all cameras
@@ -332,9 +332,10 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
           if (!deviceId && facing === 'environment' && cameras.length > 0) {
             const ultrawide = cameras.find(c => c.kind === 'ultrawide');
             if (ultrawide) {
-              // Re-start with the ultra-wide camera
+              // Re-start with the ultra-wide camera (must reset flag first)
               isStartingRef.current = false;
-              startCamera('environment', ultrawide.deviceId);
+              setIsSwitchingLens(false);
+              await startCamera('environment', ultrawide.deviceId);
               return;
             }
           }
@@ -343,22 +344,25 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
         }
       }
     } catch (err: any) {
-      console.error("Camera access error full object:", err);
-      console.error("Camera access error name:", err.name);
-      console.error("Camera access error message:", err.message);
+      console.error("Camera access error:", err?.name, err?.message);
+
+      // Camera truly failed — now clear the stream
+      streamRef.current = null;
+      setStream(null);
 
       if (err.name === 'AbortError') {
-        setError("Camera hardware failed to start (AbortError). This usually means the camera is already in use by another application or the browser is stuck. Please close other apps and refresh the page.");
+        setError("Camera hardware failed to start. Please close other apps and refresh the page.");
       } else if (err.name === 'NotReadableError' || err.message?.includes('videosource')) {
         setError("Camera is currently locked by another app. Please close other apps and try again.");
       } else if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
-        setError("Camera permission denied or blocked. If you are on Safari, ensure you are interacting with the page and haven't blocked the camera in your system settings.");
+        setError("Camera permission denied. Please allow camera access in your browser settings.");
       } else {
-        const errorMsg = err.message || (typeof err === 'string' ? err : JSON.stringify(err)) || "Unknown camera error";
+        const errorMsg = err.message || (typeof err === 'string' ? err : JSON.stringify(err)) || "Unknown error";
         setError("Could not start camera. " + errorMsg);
       }
     } finally {
       isStartingRef.current = false;
+      setIsSwitchingLens(false);
     }
   };
 
@@ -492,9 +496,26 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
       </div>
 
       <div className="relative aspect-video bg-black flex flex-col items-center justify-center">
-        {stream ? (
-          <video ref={videoRef} autoPlay muted playsInline className="absolute inset-0 w-full h-full object-cover opacity-90" />
-        ) : (
+        {/* Video element is ALWAYS in the DOM — never unmounted during lens switch */}
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          className={`absolute inset-0 w-full h-full object-cover opacity-90 ${stream ? 'block' : 'hidden'}`}
+        />
+
+        {/* Lens switching overlay — shows brief indicator while changing cameras */}
+        {isSwitchingLens && stream && (
+          <div className="absolute inset-0 flex items-center justify-center z-10">
+            <div className="bg-black/50 backdrop-blur-sm rounded-2xl px-6 py-3">
+              <span className="text-white text-xs font-black uppercase tracking-widest animate-pulse">Switching...</span>
+            </div>
+          </div>
+        )}
+
+        {/* Activate camera placeholder — only when no stream at all */}
+        {!stream && !isSwitchingLens && (
           <div className="z-10 text-center space-y-4 p-8">
             <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4 animate-pulse">
               <svg className="w-8 h-8 text-brand-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -597,10 +618,9 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
               <div className="flex flex-col gap-3">
                 <button
                   onClick={() => {
-                    stopCurrentStream();
                     setError(null);
-                    // Don't re-use the failed deviceId — just use facingMode to get any working camera
                     setSelectedCameraId(null);
+                    // Fresh start — don't re-use failed deviceId
                     startCamera(facingMode);
                   }}
                   className="w-full bg-brand-500 text-white px-6 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-brand-400"
