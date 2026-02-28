@@ -148,7 +148,7 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
       if ((camera.kind === 'unknown' || camera.kind === 'wide') && device.label) {
         try {
           const tempStream = await navigator.mediaDevices.getUserMedia({
-            video: { deviceId: { exact: device.deviceId } },
+            video: { deviceId: { ideal: device.deviceId } },
             audio: false,
           });
           const track = tempStream.getVideoTracks()[0];
@@ -166,6 +166,8 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
             }
           }
           tempStream.getTracks().forEach(t => t.stop());
+          // Small delay to let hardware fully release before probing next camera
+          await new Promise(r => setTimeout(r, 150));
         } catch (e) {
           console.warn(`Could not probe camera ${device.label}:`, e);
         }
@@ -223,8 +225,11 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
     if (isStartingRef.current) return;
     isStartingRef.current = true;
     setError(null);
-    
+
     stopCurrentStream();
+
+    // Give the phone time to release the camera hardware before opening a new one
+    await new Promise(r => setTimeout(r, 300));
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setError("Your browser does not support camera access. Please use a modern browser like Chrome or Safari.");
@@ -233,52 +238,88 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
     }
 
     try {
-      // When a specific deviceId is provided, use it; otherwise fall back to facingMode
-      const baseVideoConstraints: MediaTrackConstraints = deviceId
-        ? { deviceId: { exact: deviceId } }
+      // Use "ideal" instead of "exact" — this tells the browser to PREFER this device
+      // but gracefully fall back if it can't open it, instead of hard-failing
+      const deviceConstraints: MediaTrackConstraints = deviceId
+        ? { deviceId: { ideal: deviceId } }
         : { facingMode: { ideal: facing } };
 
+      const facingFallbackConstraints: MediaTrackConstraints = {
+        facingMode: { ideal: facing }
+      };
+
       const highResConstraints: MediaTrackConstraints = {
-        ...baseVideoConstraints,
+        ...deviceConstraints,
         width: { ideal: 1280 },
         height: { ideal: 720 }
       };
 
       let s;
       try {
-        // Try high res first
+        // Tier 1: high res with specific device + audio
         s = await navigator.mediaDevices.getUserMedia({ video: highResConstraints, audio: true });
       } catch (err: any) {
-        console.warn("Failed high-res + audio, trying basic video + audio...", err);
+        console.warn("Tier 1 failed (high-res + device + audio), trying basic device + audio...", err);
 
         try {
-          // Try basic video + audio
-          s = await navigator.mediaDevices.getUserMedia({ video: baseVideoConstraints, audio: true });
+          // Tier 2: basic device constraints + audio
+          s = await navigator.mediaDevices.getUserMedia({ video: deviceConstraints, audio: true });
         } catch (err2: any) {
-          console.warn("Failed basic video + audio, trying video only with constraints...", err2);
+          console.warn("Tier 2 failed (device + audio), trying device without audio...", err2);
 
           try {
-            // Fallback: Try video only with constraints
-            s = await navigator.mediaDevices.getUserMedia({ video: baseVideoConstraints, audio: false });
+            // Tier 3: device constraints without audio
+            s = await navigator.mediaDevices.getUserMedia({ video: deviceConstraints, audio: false });
             setError("Microphone access denied or failed. Recording video only.");
           } catch (err3: any) {
-             console.warn("Failed video only with constraints, trying absolute fallback (video: true)...", err3);
+            console.warn("Tier 3 failed (device only), trying facingMode fallback...", err3);
 
-             try {
-               // Absolute fallback: No constraints at all
-               s = await navigator.mediaDevices.getUserMedia({ video: true });
-               setError("Using default camera. Specific camera selection failed.");
-             } catch (err4: any) {
-                console.error("All camera attempts failed:", err4);
-                throw err4;
-             }
+            try {
+              // Tier 4: drop deviceId entirely, just use facingMode + audio
+              s = await navigator.mediaDevices.getUserMedia({ video: facingFallbackConstraints, audio: true });
+              if (deviceId) {
+                console.warn("Specific camera unavailable, fell back to default rear camera");
+              }
+            } catch (err4: any) {
+              console.warn("Tier 4 failed (facingMode + audio), trying absolute fallback...", err4);
+
+              try {
+                // Tier 5: absolute fallback — no constraints at all
+                s = await navigator.mediaDevices.getUserMedia({ video: true });
+                setError("Could not access specific camera. Using default.");
+              } catch (err5: any) {
+                console.error("All camera attempts failed:", err5);
+                throw err5;
+              }
+            }
           }
+        }
+      }
+
+      // Verify which camera we actually got (for deviceId requests)
+      if (deviceId && s) {
+        const activeTrack = s.getVideoTracks()[0];
+        const actualSettings = activeTrack?.getSettings?.();
+        if (actualSettings?.deviceId && actualSettings.deviceId === deviceId) {
+          // Successfully got the requested camera
+          setSelectedCameraId(deviceId);
+        } else if (actualSettings?.deviceId) {
+          // Browser gave us a different camera — update selection to match reality
+          console.warn(`Requested device ${deviceId} but got ${actualSettings.deviceId}`);
+          setSelectedCameraId(actualSettings.deviceId);
         }
       }
 
       setStream(s);
       setFacingMode(facing);
-      if (deviceId) setSelectedCameraId(deviceId);
+      if (!deviceId) {
+        // If no specific device requested, detect which device we got
+        const activeTrack = s.getVideoTracks()[0];
+        const actualSettings = activeTrack?.getSettings?.();
+        if (actualSettings?.deviceId) {
+          setSelectedCameraId(actualSettings.deviceId);
+        }
+      }
 
       // After first successful camera access, enumerate and classify all cameras
       if (!camerasEnumeratedRef.current) {
@@ -305,7 +346,7 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
       console.error("Camera access error full object:", err);
       console.error("Camera access error name:", err.name);
       console.error("Camera access error message:", err.message);
-      
+
       if (err.name === 'AbortError') {
         setError("Camera hardware failed to start (AbortError). This usually means the camera is already in use by another application or the browser is stuck. Please close other apps and refresh the page.");
       } else if (err.name === 'NotReadableError' || err.message?.includes('videosource')) {
@@ -558,8 +599,10 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
                   onClick={() => {
                     stopCurrentStream();
                     setError(null);
-                    startCamera(facingMode, selectedCameraId || undefined);
-                  }} 
+                    // Don't re-use the failed deviceId — just use facingMode to get any working camera
+                    setSelectedCameraId(null);
+                    startCamera(facingMode);
+                  }}
                   className="w-full bg-brand-500 text-white px-6 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-brand-400"
                 >
                   Retry Connection
