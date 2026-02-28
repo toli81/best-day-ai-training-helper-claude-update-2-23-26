@@ -17,6 +17,7 @@ const App: React.FC = () => {
   const trainerId = user?.uid;
 
   const [view, setView] = useState<ViewState>('dashboard');
+  const [isRecording, setIsRecording] = useState(false);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -526,7 +527,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <Layout activeTab={view} onNavigate={setView}>
+    <Layout activeTab={view} onNavigate={setView} isRecording={isRecording}>
       {/* Migration dialog for first-time cloud login with existing local data */}
       {showMigration && trainerId && (
         <MigrationDialog
@@ -544,7 +545,7 @@ const App: React.FC = () => {
           >
             ← Back to Dashboard
           </button>
-          <Recorder onSessionComplete={handleSessionComplete} />
+          <Recorder onSessionComplete={handleSessionComplete} onRecordingStateChange={setIsRecording} />
         </div>
       )}
 

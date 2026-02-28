@@ -2,18 +2,28 @@
 import React, { useRef, useState, useCallback, useEffect } from 'react';
 import { SessionMode } from '../types';
 
-interface RecorderProps {
-  onSessionComplete: (blob: Blob, clientName: string, mode: SessionMode, snapshots: string[], duration: number) => void;
+type CameraKind = 'ultrawide' | 'wide' | 'telephoto' | 'front' | 'unknown';
+
+interface CameraDevice {
+  deviceId: string;
+  label: string;
+  kind: CameraKind;
+  focalLengthRange?: { min: number; max: number };
 }
 
-const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
+interface RecorderProps {
+  onSessionComplete: (blob: Blob, clientName: string, mode: SessionMode, snapshots: string[], duration: number) => void;
+  onRecordingStateChange?: (isRecording: boolean) => void;
+}
+
+const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingStateChange }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const isStartingRef = useRef(false);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isProcessingUpload, setIsProcessingUpload] = useState(false);
-  
+
   const [recording, setRecording] = useState(false);
   const [clientName, setClientName] = useState('');
   const [chunks, setChunks] = useState<Blob[]>([]);
@@ -23,6 +33,11 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
   const [mode, setMode] = useState<SessionMode>('clip');
   const [snapshots, setSnapshots] = useState<string[]>([]);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
+
+  // Camera lens selection state
+  const [availableCameras, setAvailableCameras] = useState<CameraDevice[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
+  const camerasEnumeratedRef = useRef(false);
 
   // Keep streamRef in sync with state for cleanup
   useEffect(() => {
@@ -35,8 +50,9 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
+      onRecordingStateChange?.(false);
     };
-  }, []);
+  }, [onRecordingStateChange]);
 
   const captureSnapshot = useCallback(() => {
     if (!videoRef.current || !recording) return;
@@ -97,7 +113,81 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
     }
   }, [stream]);
 
-  const startCamera = async (facing: 'user' | 'environment') => {
+  // Classify a camera device by its label
+  const classifyByLabel = (label: string): CameraKind => {
+    const l = label.toLowerCase();
+    if (l.includes('front') || l.includes('facing front') || l.includes('facetime')) return 'front';
+    if (l.includes('ultra') || l.includes('0.5x') || l.includes('0.5')) return 'ultrawide';
+    if (l.includes('tele') || l.includes('2x') || l.includes('3x') || l.includes('5x') || l.includes('zoom')) return 'telephoto';
+    if (l.includes('wide') && !l.includes('ultra')) return 'wide';
+    return 'unknown';
+  };
+
+  // Enumerate and classify all available cameras
+  const enumerateAndClassifyCameras = useCallback(async (): Promise<CameraDevice[]> => {
+    if (!navigator.mediaDevices?.enumerateDevices) return [];
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+    if (videoDevices.length <= 1) return []; // No point showing selector for a single camera
+
+    const classified: CameraDevice[] = [];
+
+    for (const device of videoDevices) {
+      const camera: CameraDevice = {
+        deviceId: device.deviceId,
+        label: device.label || `Camera ${classified.length + 1}`,
+        kind: 'unknown',
+      };
+
+      // Fast classification from label (no stream needed)
+      camera.kind = classifyByLabel(camera.label);
+
+      // If still unknown and we have a label (permission was granted), try capabilities probe
+      if (camera.kind === 'unknown' && device.label) {
+        try {
+          const tempStream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: { exact: device.deviceId } },
+            audio: false,
+          });
+          const track = tempStream.getVideoTracks()[0];
+          if (track && typeof track.getCapabilities === 'function') {
+            const caps = track.getCapabilities() as any;
+            if (caps.focalLength) {
+              camera.focalLengthRange = { min: caps.focalLength.min, max: caps.focalLength.max };
+              if (caps.focalLength.min < 20) camera.kind = 'ultrawide';
+              else if (caps.focalLength.min < 40) camera.kind = 'wide';
+              else camera.kind = 'telephoto';
+            }
+          }
+          tempStream.getTracks().forEach(t => t.stop());
+        } catch (e) {
+          console.warn(`Could not probe camera ${device.label}:`, e);
+        }
+      }
+
+      // Default: non-front unknown cameras are probably "wide" (the main camera)
+      if (camera.kind === 'unknown') {
+        const l = camera.label.toLowerCase();
+        if (!l.includes('front') && !l.includes('facetime')) {
+          camera.kind = 'wide';
+        } else {
+          camera.kind = 'front';
+        }
+      }
+
+      classified.push(camera);
+    }
+
+    // Sort: ultrawide first, then wide, telephoto, front, unknown
+    const sortOrder: Record<CameraKind, number> = { ultrawide: 0, wide: 1, telephoto: 2, front: 3, unknown: 4 };
+    classified.sort((a, b) => sortOrder[a.kind] - sortOrder[b.kind]);
+
+    return classified;
+  }, []);
+
+  const startCamera = async (facing: 'user' | 'environment', deviceId?: string) => {
     if (isStartingRef.current) return;
     isStartingRef.current = true;
     setError(null);
@@ -111,14 +201,14 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
     }
 
     try {
-      // Must be triggered by user gesture to avoid "NotAllowedError" in some contexts
-      const baseVideoConstraints = { 
-        facingMode: { ideal: facing }
-      };
+      // When a specific deviceId is provided, use it; otherwise fall back to facingMode
+      const baseVideoConstraints: MediaTrackConstraints = deviceId
+        ? { deviceId: { exact: deviceId } }
+        : { facingMode: { ideal: facing } };
 
-      const highResConstraints = {
+      const highResConstraints: MediaTrackConstraints = {
         ...baseVideoConstraints,
-        width: { ideal: 1280 }, 
+        width: { ideal: 1280 },
         height: { ideal: 720 }
       };
 
@@ -128,20 +218,20 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
         s = await navigator.mediaDevices.getUserMedia({ video: highResConstraints, audio: true });
       } catch (err: any) {
         console.warn("Failed high-res + audio, trying basic video + audio...", err);
-        
+
         try {
           // Try basic video + audio
           s = await navigator.mediaDevices.getUserMedia({ video: baseVideoConstraints, audio: true });
         } catch (err2: any) {
           console.warn("Failed basic video + audio, trying video only with constraints...", err2);
-          
+
           try {
             // Fallback: Try video only with constraints
             s = await navigator.mediaDevices.getUserMedia({ video: baseVideoConstraints, audio: false });
             setError("Microphone access denied or failed. Recording video only.");
           } catch (err3: any) {
              console.warn("Failed video only with constraints, trying absolute fallback (video: true)...", err3);
-             
+
              try {
                // Absolute fallback: No constraints at all
                s = await navigator.mediaDevices.getUserMedia({ video: true });
@@ -153,9 +243,32 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
           }
         }
       }
-      
+
       setStream(s);
       setFacingMode(facing);
+      if (deviceId) setSelectedCameraId(deviceId);
+
+      // After first successful camera access, enumerate and classify all cameras
+      if (!camerasEnumeratedRef.current) {
+        camerasEnumeratedRef.current = true;
+        try {
+          const cameras = await enumerateAndClassifyCameras();
+          setAvailableCameras(cameras);
+
+          // Auto-switch to widest lens if we're on the rear camera and haven't selected one yet
+          if (!deviceId && facing === 'environment' && cameras.length > 0) {
+            const ultrawide = cameras.find(c => c.kind === 'ultrawide');
+            if (ultrawide) {
+              // Re-start with the ultra-wide camera
+              isStartingRef.current = false;
+              startCamera('environment', ultrawide.deviceId);
+              return;
+            }
+          }
+        } catch (e) {
+          console.warn('Camera enumeration failed:', e);
+        }
+      }
     } catch (err: any) {
       console.error("Camera access error full object:", err);
       console.error("Camera access error name:", err.name);
@@ -177,8 +290,25 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
   };
 
   const toggleCamera = () => {
-    const nextFacing = facingMode === 'user' ? 'environment' : 'user';
-    startCamera(nextFacing);
+    if (facingMode === 'user') {
+      // Switching back to rear: use previously selected rear camera or default
+      if (selectedCameraId) {
+        const selectedCam = availableCameras.find(c => c.deviceId === selectedCameraId);
+        if (selectedCam && selectedCam.kind !== 'front') {
+          startCamera('environment', selectedCameraId);
+          return;
+        }
+      }
+      startCamera('environment');
+    } else {
+      // Switching to front: find front camera device if available
+      const frontCamera = availableCameras.find(c => c.kind === 'front');
+      if (frontCamera) {
+        startCamera('user', frontCamera.deviceId);
+      } else {
+        startCamera('user');
+      }
+    }
   };
 
   const startRecording = useCallback(() => {
@@ -202,6 +332,7 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
       recorder.start(1000);
       mediaRecorderRef.current = recorder;
       setRecording(true);
+      onRecordingStateChange?.(true);
     } catch (e: any) {
       console.error("Recorder error:", e);
       const errorMsg = e.message || (typeof e === 'string' ? e : JSON.stringify(e)) || "Unknown recorder error";
@@ -318,16 +449,46 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
           </div>
         )}
         
+        {/* Camera flip button (front/back toggle) */}
         {!recording && stream && (
-          <button 
+          <button
             onClick={toggleCamera}
             className="absolute bottom-6 right-6 p-4 bg-white/10 hover:bg-white/20 backdrop-blur-xl border border-white/20 rounded-2xl text-white transition-all active:scale-90 z-20"
-            title="Switch Camera"
+            title="Switch Front/Back Camera"
           >
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
           </button>
+        )}
+
+        {/* Lens selector pill (only when multiple rear cameras exist and not recording) */}
+        {!recording && stream && facingMode === 'environment' && availableCameras.filter(c => c.kind !== 'front').length > 1 && (
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-1 bg-black/40 backdrop-blur-xl rounded-full px-1.5 py-1 border border-white/20 z-20">
+            {availableCameras
+              .filter(c => c.kind !== 'front')
+              .map(camera => {
+                const isActive = camera.deviceId === selectedCameraId;
+                const label = camera.kind === 'ultrawide' ? '0.5x'
+                  : camera.kind === 'wide' ? '1x'
+                  : camera.kind === 'telephoto' ? '2x'
+                  : '?';
+                return (
+                  <button
+                    key={camera.deviceId}
+                    onClick={() => startCamera('environment', camera.deviceId)}
+                    className={`min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-xs font-black transition-all ${
+                      isActive
+                        ? 'bg-brand-500 text-white scale-110 shadow-lg'
+                        : 'text-white/70 active:bg-white/10'
+                    }`}
+                    title={camera.label}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+          </div>
         )}
 
         {recording && (
@@ -352,11 +513,11 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
                 </p>
               </div>
               <div className="flex flex-col gap-3">
-                <button 
+                <button
                   onClick={() => {
                     stopCurrentStream();
                     setError(null);
-                    startCamera(facingMode);
+                    startCamera(facingMode, selectedCameraId || undefined);
                   }} 
                   className="w-full bg-brand-500 text-white px-6 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-brand-400"
                 >
@@ -426,7 +587,7 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete }) => {
             </>
           ) : (
             <button
-              onClick={() => { mediaRecorderRef.current?.stop(); setRecording(false); }}
+              onClick={() => { mediaRecorderRef.current?.stop(); setRecording(false); onRecordingStateChange?.(false); }}
               className="flex-1 bg-slate-900 text-white font-black py-5 rounded-2xl active:scale-95 transition-all uppercase text-xs tracking-[0.2em] shadow-xl shadow-slate-200"
             >
               End Session
