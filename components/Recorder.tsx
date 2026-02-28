@@ -144,8 +144,8 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
       // Fast classification from label (no stream needed)
       camera.kind = classifyByLabel(camera.label);
 
-      // If still unknown and we have a label (permission was granted), try capabilities probe
-      if (camera.kind === 'unknown' && device.label) {
+      // If still unknown or needs verification, probe capabilities via temporary stream
+      if ((camera.kind === 'unknown' || camera.kind === 'wide') && device.label) {
         try {
           const tempStream = await navigator.mediaDevices.getUserMedia({
             video: { deviceId: { exact: device.deviceId } },
@@ -159,6 +159,10 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
               if (caps.focalLength.min < 20) camera.kind = 'ultrawide';
               else if (caps.focalLength.min < 40) camera.kind = 'wide';
               else camera.kind = 'telephoto';
+            }
+            // Also check zoom range — cameras with zoom.min < 1 are typically ultra-wide
+            if (!camera.focalLengthRange && caps.zoom) {
+              if (caps.zoom.min < 1) camera.kind = 'ultrawide';
             }
           }
           tempStream.getTracks().forEach(t => t.stop());
@@ -183,6 +187,34 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
     // Sort: ultrawide first, then wide, telephoto, front, unknown
     const sortOrder: Record<CameraKind, number> = { ultrawide: 0, wide: 1, telephoto: 2, front: 3, unknown: 4 };
     classified.sort((a, b) => sortOrder[a.kind] - sortOrder[b.kind]);
+
+    // Deduplicate: if multiple rear cameras share the same kind (e.g. all "wide"),
+    // assign distinct kinds based on position — typically widest first on most phones
+    const rearCams = classified.filter(c => c.kind !== 'front');
+    const allSameKind = rearCams.length > 1 && rearCams.every(c => c.kind === rearCams[0].kind);
+    if (allSameKind && rearCams.length >= 2) {
+      // Assign by position: most phones enumerate ultra-wide, wide, telephoto in order
+      // But some put main camera first — use focal length data if available
+      const withFocal = rearCams.filter(c => c.focalLengthRange);
+      if (withFocal.length >= 2) {
+        withFocal.sort((a, b) => a.focalLengthRange!.min - b.focalLengthRange!.min);
+        withFocal[0].kind = 'ultrawide';
+        if (withFocal.length >= 3) withFocal[withFocal.length - 1].kind = 'telephoto';
+        // Middle one(s) stay as 'wide'
+      } else {
+        // No focal length data — assign by position
+        if (rearCams.length === 2) {
+          rearCams[0].kind = 'ultrawide';
+          rearCams[1].kind = 'wide';
+        } else if (rearCams.length >= 3) {
+          rearCams[0].kind = 'ultrawide';
+          rearCams[1].kind = 'wide';
+          rearCams[2].kind = 'telephoto';
+        }
+      }
+      // Re-sort after reassignment
+      classified.sort((a, b) => sortOrder[a.kind] - sortOrder[b.kind]);
+    }
 
     return classified;
   }, []);
@@ -492,10 +524,19 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
         )}
 
         {recording && (
-           <div className="absolute top-6 right-6 flex items-center gap-2 bg-black/40 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 z-20">
+          <>
+            <div className="absolute top-6 right-6 flex items-center gap-2 bg-black/40 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 z-20">
               <div className="w-2 h-2 bg-red-600 rounded-full animate-pulse"></div>
               <span className="text-[9px] font-black text-white uppercase tracking-widest">Live</span>
-           </div>
+            </div>
+            {/* End Session button overlaid on video during recording */}
+            <button
+              onClick={() => { mediaRecorderRef.current?.stop(); setRecording(false); onRecordingStateChange?.(false); }}
+              className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-red-600/90 backdrop-blur-xl text-white font-black px-8 py-3 rounded-full active:scale-95 transition-all uppercase text-[10px] tracking-widest border border-white/20 shadow-lg z-20"
+            >
+              End Session
+            </button>
+          </>
         )}
         
         {error && (
@@ -535,8 +576,9 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
         )}
       </div>
 
-      <div className="p-6 space-y-6">
-        {!recording && (
+      {/* Controls below video — hidden during recording for full-screen camera view */}
+      {!recording ? (
+        <div className="p-6 space-y-6">
           <div className="grid grid-cols-3 gap-3">
             {[
               { id: 'clip', label: 'Clip', desc: '< 5 mins' },
@@ -553,57 +595,45 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
               </button>
             ))}
           </div>
-        )}
 
-        <div>
-          <label className="text-[10px] font-black text-slate-400 uppercase mb-2 block tracking-widest">Athlete Profile</label>
-          <input 
-            type="text" 
-            placeholder="e.g. David Goggins" 
-            value={clientName} 
-            onChange={e => setClientName(e.target.value)} 
-            disabled={recording} 
-            className="w-full px-5 py-4 rounded-2xl border border-slate-200 text-sm outline-none focus:ring-4 focus:ring-brand-100 transition-all placeholder:text-slate-300 font-medium" 
-          />
-        </div>
-        
-        <div className="flex gap-4">
-          {!recording ? (
-            <>
-              <button
-                onClick={startRecording}
-                disabled={!!error || !stream}
-                className="flex-1 bg-brand-500 text-white font-black py-5 rounded-2xl shadow-xl shadow-brand-100 hover:bg-brand-600 active:scale-95 transition-all uppercase text-xs tracking-[0.2em] disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Start Recording
-              </button>
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isProcessingUpload || recording}
-                className="flex-1 bg-slate-800 text-white font-black py-5 rounded-2xl hover:bg-slate-700 active:scale-95 transition-all uppercase text-xs tracking-[0.2em] disabled:opacity-50"
-              >
-                {isProcessingUpload ? 'Processing…' : 'Upload Video'}
-              </button>
-            </>
-          ) : (
+          <div>
+            <label className="text-[10px] font-black text-slate-400 uppercase mb-2 block tracking-widest">Athlete Profile</label>
+            <input
+              type="text"
+              placeholder="e.g. David Goggins"
+              value={clientName}
+              onChange={e => setClientName(e.target.value)}
+              className="w-full px-5 py-4 rounded-2xl border border-slate-200 text-sm outline-none focus:ring-4 focus:ring-brand-100 transition-all placeholder:text-slate-300 font-medium"
+            />
+          </div>
+
+          <div className="flex gap-4">
             <button
-              onClick={() => { mediaRecorderRef.current?.stop(); setRecording(false); onRecordingStateChange?.(false); }}
-              className="flex-1 bg-slate-900 text-white font-black py-5 rounded-2xl active:scale-95 transition-all uppercase text-xs tracking-[0.2em] shadow-xl shadow-slate-200"
+              onClick={startRecording}
+              disabled={!!error || !stream}
+              className="flex-1 bg-brand-500 text-white font-black py-5 rounded-2xl shadow-xl shadow-brand-100 hover:bg-brand-600 active:scale-95 transition-all uppercase text-xs tracking-[0.2em] disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              End Session
+              Start Recording
             </button>
-          )}
-          
-          {chunks.length > 0 && !recording && (
-            <button 
-              onClick={() => onSessionComplete(new Blob(chunks, { type: mediaRecorderRef.current?.mimeType }), clientName || 'Client', mode, snapshots, timer)} 
-              className="flex-1 bg-green-600 text-white font-black py-5 rounded-2xl shadow-xl shadow-green-100 active:scale-95 transition-all uppercase text-xs tracking-[0.2em]"
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isProcessingUpload}
+              className="flex-1 bg-slate-800 text-white font-black py-5 rounded-2xl hover:bg-slate-700 active:scale-95 transition-all uppercase text-xs tracking-[0.2em] disabled:opacity-50"
+            >
+              {isProcessingUpload ? 'Processing…' : 'Upload Video'}
+            </button>
+          </div>
+
+          {chunks.length > 0 && (
+            <button
+              onClick={() => onSessionComplete(new Blob(chunks, { type: mediaRecorderRef.current?.mimeType }), clientName || 'Client', mode, snapshots, timer)}
+              className="w-full bg-green-600 text-white font-black py-5 rounded-2xl shadow-xl shadow-green-100 active:scale-95 transition-all uppercase text-xs tracking-[0.2em]"
             >
               Run AI Report
             </button>
           )}
         </div>
-      </div>
+      ) : null}
     </div>
   );
 };
