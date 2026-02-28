@@ -20,6 +20,7 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const isStartingRef = useRef(false);
+  const startingTimestampRef = useRef(0); // Safety: track when startCamera began
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isProcessingUpload, setIsProcessingUpload] = useState(false);
@@ -95,16 +96,6 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
       currentStream.getTracks().forEach(track => track.stop());
     }
   }, []);
-
-  // Full stream stop (for unmounting scenarios)
-  const stopCurrentStream = useCallback(() => {
-    stopTracksOnly();
-    streamRef.current = null;
-    setStream(null);
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-  }, [stopTracksOnly]);
 
   // Attach stream to video element whenever stream changes
   useEffect(() => {
@@ -230,11 +221,20 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
   }, []);
 
   const startCamera = async (facing: 'user' | 'environment', deviceId?: string) => {
+    // Safety: if isStartingRef has been stuck for more than 10 seconds, force-reset it
     if (isStartingRef.current) {
-      console.warn('startCamera called while already starting, ignoring');
-      return;
+      const elapsed = Date.now() - startingTimestampRef.current;
+      if (elapsed > 10000) {
+        console.warn(`isStartingRef was stuck for ${elapsed}ms, force-resetting`);
+        isStartingRef.current = false;
+        setIsSwitchingLens(false);
+      } else {
+        console.warn('startCamera called while already starting, ignoring');
+        return;
+      }
     }
     isStartingRef.current = true;
+    startingTimestampRef.current = Date.now();
     setError(null);
 
     // If we already have a stream, this is a lens/camera switch — show switching indicator
@@ -506,15 +506,15 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
         />
 
         {/* Lens switching overlay — shows brief indicator while changing cameras */}
-        {isSwitchingLens && stream && (
-          <div className="absolute inset-0 flex items-center justify-center z-10">
-            <div className="bg-black/50 backdrop-blur-sm rounded-2xl px-6 py-3">
+        {isSwitchingLens && (
+          <div className="absolute inset-0 flex items-center justify-center z-10 bg-black/30">
+            <div className="bg-black/60 backdrop-blur-sm rounded-2xl px-6 py-3">
               <span className="text-white text-xs font-black uppercase tracking-widest animate-pulse">Switching...</span>
             </div>
           </div>
         )}
 
-        {/* Activate camera placeholder — only when no stream at all */}
+        {/* Activate camera placeholder — only when no stream and not switching */}
         {!stream && !isSwitchingLens && (
           <div className="z-10 text-center space-y-4 p-8">
             <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4 animate-pulse">
@@ -528,7 +528,10 @@ const Recorder: React.FC<RecorderProps> = ({ onSessionComplete, onRecordingState
               To start recording, we need access to your camera and microphone.
             </p>
             <button
-              onClick={() => startCamera(facingMode)}
+              onClick={() => {
+                console.log('Activate Camera tapped');
+                startCamera(facingMode);
+              }}
               className="mt-4 px-8 py-3 bg-brand-500 text-white font-black uppercase tracking-widest text-xs rounded-xl shadow-lg shadow-brand-500/30 hover:bg-brand-400 transition-all active:scale-95"
             >
               Activate Camera
