@@ -9,6 +9,7 @@ import { useAuth } from './hooks/useAuth';
 import { useFirestoreSessions } from './hooks/useFirestoreSessions';
 import { saveSession, updateSession, deleteSession as deleteFirestoreSession, ensureClient } from './services/firestoreService';
 import { enqueue as enqueueSyncTask, init as initSyncService, registerCallbacks } from './services/syncService';
+import { addExerciseToLibrary } from './services/exerciseLibraryService';
 import { hasLocalData } from './services/migrationService';
 import MigrationDialog from './components/MigrationDialog';
 
@@ -199,9 +200,19 @@ const App: React.FC = () => {
       // Update local UI immediately — don't await Firestore so it can't block the loading state
       setSessions(prev => prev ? prev.map(s => s.id === session.id ? { ...s, ...updatedFields } : s) : prev);
 
-      // Firestore write is fire-and-forget
+      // Firestore write — then auto-share all exercises to the library
       if (trainerId) {
-        updateSession(trainerId, session.id, updatedFields).catch(console.error);
+        updateSession(trainerId, session.id, updatedFields)
+          .then(() => {
+            // Auto-add all exercises to the shared library (fire-and-forget)
+            // Cloud function reads session from Firestore, so updateSession must finish first
+            analysis.exercises.forEach(ex => {
+              addExerciseToLibrary(session.id, ex.id).catch(err =>
+                console.warn(`[Auto-share] Failed for ${ex.id}:`, err.message)
+              );
+            });
+          })
+          .catch(console.error);
       }
 
     } catch (err: any) {

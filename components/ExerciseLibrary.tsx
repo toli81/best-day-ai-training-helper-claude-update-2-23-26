@@ -72,7 +72,7 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
   const filteredMyExercises = useMemo(() => {
     return allExercises.filter(ex => {
       const q = search.toLowerCase();
-      const matchesSearch = !q || ex.name.toLowerCase().includes(q) || ex.clientName.toLowerCase().includes(q);
+      const matchesSearch = !q || ex.name.toLowerCase().includes(q) || ex.clientName.toLowerCase().includes(q) || ex.tags.some(t => t.toLowerCase().includes(q));
       const matchesTag = !selectedTag || ex.tags.includes(selectedTag);
       return matchesSearch && matchesTag;
     });
@@ -82,7 +82,7 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
   const filteredShared = useMemo(() => {
     return sharedLibrary.filter(ex => {
       const q = search.toLowerCase();
-      const matchesSearch = !q || ex.name.toLowerCase().includes(q) || ex.clientName.toLowerCase().includes(q) || ex.sourceTrainerName.toLowerCase().includes(q);
+      const matchesSearch = !q || ex.name.toLowerCase().includes(q) || ex.clientName.toLowerCase().includes(q) || ex.sourceTrainerName.toLowerCase().includes(q) || ex.tags.some(t => t.toLowerCase().includes(q));
       const matchesTag = !selectedTag || ex.tags.includes(selectedTag);
       return matchesSearch && matchesTag;
     });
@@ -231,7 +231,7 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
           <input type="text"
-            placeholder={tab === 'shared-library' ? 'Search shared library by name, tag, or trainer...' : 'Search by exercise name or athlete...'}
+            placeholder={tab === 'shared-library' ? 'Search shared library by name, tag, or trainer...' : 'Search by exercise name, tag, or athlete...'}
             value={search} onChange={e => setSearch(e.target.value)}
             className="w-full pl-12 pr-6 py-4 bg-slate-50 border-none rounded-2xl outline-none focus:ring-4 focus:ring-brand-100 transition-all font-semibold text-sm"
           />
