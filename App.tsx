@@ -38,10 +38,24 @@ const App: React.FC = () => {
   const [editingExerciseId, setEditingExerciseId] = useState<string | null>(null);
   const [tempExerciseName, setTempExerciseName] = useState('');
 
+  // Editable report fields
+  const [editingSummary, setEditingSummary] = useState(false);
+  const [tempSummary, setTempSummary] = useState('');
+  const [editingTrainerCueIdx, setEditingTrainerCueIdx] = useState<number | null>(null);
+  const [tempTrainerCue, setTempTrainerCue] = useState('');
+  const [editingExCue, setEditingExCue] = useState<{ exId: string; cueIdx: number } | null>(null);
+  const [tempExCue, setTempExCue] = useState('');
+  const [editingReps, setEditingReps] = useState<string | null>(null);
+  const [tempReps, setTempReps] = useState('');
+  const [editingWeight, setEditingWeight] = useState<string | null>(null);
+  const [tempWeight, setTempWeight] = useState('');
+  const [editingProtocol, setEditingProtocol] = useState(false);
+  const [tempProtocol, setTempProtocol] = useState('');
+
   const videoPlayerRef = useRef<HTMLVideoElement>(null);
 
   // Firestore real-time sessions (replaces localStorage)
-  const { sessions: firestoreSessions, loading: sessionsLoading } = useFirestoreSessions(trainerId);
+  const { sessions: firestoreSessions, loading: sessionsLoading, error: sessionsError, retry: retrySessions } = useFirestoreSessions(trainerId);
 
   // Local override for optimistic UI (set briefly during saves, cleared by Firestore listener)
   const [localSessions, setLocalSessions] = useState<TrainingSession[] | null>(null);
@@ -470,6 +484,109 @@ const App: React.FC = () => {
     }
   };
 
+  // Generic helper to update any analysis field and persist
+  const updateAnalysisField = (sessionId: string, patch: Partial<SessionAnalysis>) => {
+    const allSessions = firestoreSessions.length > 0 ? firestoreSessions : (localSessions || []);
+    const updated = allSessions.map(session => {
+      if (session.id !== sessionId || !session.analysis) return session;
+      return { ...session, analysis: { ...session.analysis, ...patch } };
+    });
+    setSessions(updated);
+    const changed = updated.find(s => s.id === sessionId);
+    if (trainerId && changed) {
+      updateSession(trainerId, sessionId, { analysis: changed.analysis }).catch(console.error);
+    }
+  };
+
+  const handleUpdateSummary = (sessionId: string, newSummary: string) => {
+    updateAnalysisField(sessionId, { summary: newSummary });
+  };
+
+  const handleUpdateTrainerCue = (sessionId: string, idx: number, newCue: string) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const cues = [...session.analysis.trainerCues];
+    cues[idx] = newCue;
+    updateAnalysisField(sessionId, { trainerCues: cues });
+  };
+
+  const handleAddTrainerCue = (sessionId: string) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const cues = [...session.analysis.trainerCues, 'New directive'];
+    updateAnalysisField(sessionId, { trainerCues: cues });
+    setEditingTrainerCueIdx(cues.length - 1);
+    setTempTrainerCue('New directive');
+  };
+
+  const handleRemoveTrainerCue = (sessionId: string, idx: number) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const cues = session.analysis.trainerCues.filter((_, i) => i !== idx);
+    updateAnalysisField(sessionId, { trainerCues: cues });
+  };
+
+  const handleUpdateExerciseCue = (sessionId: string, exId: string, cueIdx: number, newCue: string) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const exercises = session.analysis.exercises.map(ex => {
+      if (ex.id !== exId) return ex;
+      const cues = [...ex.cues];
+      cues[cueIdx] = newCue;
+      return { ...ex, cues };
+    });
+    updateAnalysisField(sessionId, { exercises });
+  };
+
+  const handleAddExerciseCue = (sessionId: string, exId: string) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const exercises = session.analysis.exercises.map(ex => {
+      if (ex.id !== exId) return ex;
+      return { ...ex, cues: [...ex.cues, 'New cue'] };
+    });
+    updateAnalysisField(sessionId, { exercises });
+    const ex = exercises.find(e => e.id === exId);
+    if (ex) {
+      setEditingExCue({ exId, cueIdx: ex.cues.length - 1 });
+      setTempExCue('New cue');
+    }
+  };
+
+  const handleRemoveExerciseCue = (sessionId: string, exId: string, cueIdx: number) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const exercises = session.analysis.exercises.map(ex => {
+      if (ex.id !== exId) return ex;
+      return { ...ex, cues: ex.cues.filter((_, i) => i !== cueIdx) };
+    });
+    updateAnalysisField(sessionId, { exercises });
+  };
+
+  const handleUpdateExerciseReps = (sessionId: string, exId: string, newReps: string) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const exercises = session.analysis.exercises.map(ex => {
+      if (ex.id !== exId) return ex;
+      return { ...ex, reps: newReps };
+    });
+    updateAnalysisField(sessionId, { exercises });
+  };
+
+  const handleUpdateExerciseWeight = (sessionId: string, exId: string, newWeight: string) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session?.analysis) return;
+    const exercises = session.analysis.exercises.map(ex => {
+      if (ex.id !== exId) return ex;
+      return { ...ex, weight: newWeight };
+    });
+    updateAnalysisField(sessionId, { exercises });
+  };
+
+  const handleUpdateProtocol = (sessionId: string, newProtocol: string) => {
+    updateAnalysisField(sessionId, { protocolRecommendations: newProtocol });
+  };
+
   const formatDuration = (s: number) => {
     const m = Math.floor(s / 60);
     const sec = s % 60;
@@ -653,10 +770,23 @@ const App: React.FC = () => {
           )}
 
 
-          {sessions.length === 0 && !isAnalyzing ? (
+          {sessionsLoading && sessions.length === 0 ? (
+            <div className="bg-white border-2 border-dashed border-slate-200 p-20 rounded-[40px] text-center">
+              <div className="w-8 h-8 border-4 border-brand-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+              <p className="text-slate-400 font-black uppercase tracking-[0.2em] text-xs">Loading Training Data...</p>
+            </div>
+          ) : sessionsError ? (
+            <div className="bg-white border-2 border-dashed border-red-200 p-20 rounded-[40px] text-center space-y-4">
+              <p className="text-red-400 font-black uppercase tracking-[0.2em] text-xs">Failed to Load Sessions</p>
+              <p className="text-slate-400 text-xs">{sessionsError}</p>
+              <button onClick={retrySessions} className="mt-4 text-brand-500 font-black text-[10px] uppercase tracking-widest hover:underline">
+                Retry →
+              </button>
+            </div>
+          ) : sessions.length === 0 && !isAnalyzing ? (
             <div className="bg-white border-2 border-dashed border-slate-200 p-20 rounded-[40px] text-center">
                <p className="text-slate-400 font-black uppercase tracking-[0.2em] text-xs">No Training Data Found</p>
-               <button 
+               <button
                  onClick={() => setView('recorder')}
                  className="mt-6 text-brand-500 font-black text-[10px] uppercase tracking-widest hover:underline"
                >
@@ -924,7 +1054,7 @@ const App: React.FC = () => {
               </div>
 
               {/* Phase 2 Progress Banner */}
-              {(['specialists_running', 'consensus_running', 'report_generating'] as AnalysisJobStatus[]).includes(selectedSession.analysisStatus as AnalysisJobStatus) && (
+              {(['specialists_running', 'report_generating'] as AnalysisJobStatus[]).includes(selectedSession.analysisStatus as AnalysisJobStatus) && (
                 <div className="bg-gradient-to-r from-brand-50 to-violet-50 border border-brand-100 rounded-[32px] p-6 space-y-4">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
@@ -952,7 +1082,7 @@ const App: React.FC = () => {
                     />
                   </div>
                   <p className="text-[10px] text-slate-500 font-medium">
-                    PT Expert, S&C Coach, and Audio Analyst are reviewing the session. Your coaching report will be ready shortly.
+                    PT Expert and Audio Analyst are reviewing the session. Your coaching report will be ready shortly.
                   </p>
                 </div>
               )}
@@ -1057,10 +1187,50 @@ const App: React.FC = () => {
                             </div>
                             <ul className="space-y-1.5">
                               {ex.cues.map((cue, ci) => (
-                                <li key={ci} className="text-xs text-slate-500 font-medium flex gap-2">
-                                  <span className="text-brand-500">•</span> {cue}
+                                <li key={ci} className="text-xs text-slate-500 font-medium flex gap-2 group/cue items-start">
+                                  <span className="text-brand-500 mt-0.5">•</span>
+                                  {editingExCue?.exId === ex.id && editingExCue?.cueIdx === ci ? (
+                                    <input
+                                      autoFocus
+                                      className="flex-1 text-xs text-slate-600 font-medium bg-white border border-brand-200 rounded px-2 py-0.5 outline-none focus:ring-2 focus:ring-brand-500"
+                                      value={tempExCue}
+                                      onChange={(e) => setTempExCue(e.target.value)}
+                                      onBlur={() => {
+                                        if (tempExCue.trim()) handleUpdateExerciseCue(selectedSession.id, ex.id, ci, tempExCue.trim());
+                                        setEditingExCue(null);
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          if (tempExCue.trim()) handleUpdateExerciseCue(selectedSession.id, ex.id, ci, tempExCue.trim());
+                                          setEditingExCue(null);
+                                        }
+                                      }}
+                                    />
+                                  ) : (
+                                    <span
+                                      className="cursor-pointer hover:text-brand-500 transition-colors flex-1"
+                                      onClick={() => { setEditingExCue({ exId: ex.id, cueIdx: ci }); setTempExCue(cue); }}
+                                    >
+                                      {cue}
+                                    </span>
+                                  )}
+                                  <button
+                                    onClick={() => handleRemoveExerciseCue(selectedSession.id, ex.id, ci)}
+                                    className="opacity-0 group-hover/cue:opacity-100 text-slate-300 hover:text-red-400 transition-all shrink-0"
+                                    title="Remove cue"
+                                  >
+                                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                                  </button>
                                 </li>
                               ))}
+                              <li>
+                                <button
+                                  onClick={() => handleAddExerciseCue(selectedSession.id, ex.id)}
+                                  className="text-[9px] font-black text-brand-400 uppercase tracking-widest hover:text-brand-600 transition-colors"
+                                >
+                                  + Add Cue
+                                </button>
+                              </li>
                             </ul>
                             <div className="flex flex-wrap gap-1.5 pt-2">
                                {ex.tags.map(tag => (
@@ -1073,11 +1243,49 @@ const App: React.FC = () => {
                               Timeline: {formatDuration(ex.startTime)} — {formatDuration(ex.endTime)}
                             </div>
                           </div>
-                          <div className="text-right flex md:flex-col items-center md:items-end justify-between md:justify-start">
+                          <div className="text-right flex md:flex-col items-center md:items-end justify-between md:justify-start gap-2">
                             <div className="flex flex-col items-center md:items-end">
-                              <span className="text-brand-500 text-2xl font-black tabular-nums">{ex.reps}</span>
+                              {editingReps === ex.id ? (
+                                <input
+                                  autoFocus
+                                  className="text-brand-500 text-2xl font-black tabular-nums bg-white border border-brand-200 rounded w-20 text-center outline-none focus:ring-2 focus:ring-brand-500"
+                                  value={tempReps}
+                                  onChange={(e) => setTempReps(e.target.value)}
+                                  onBlur={() => { if (tempReps.trim()) handleUpdateExerciseReps(selectedSession.id, ex.id, tempReps.trim()); setEditingReps(null); }}
+                                  onKeyDown={(e) => { if (e.key === 'Enter') { if (tempReps.trim()) handleUpdateExerciseReps(selectedSession.id, ex.id, tempReps.trim()); setEditingReps(null); }}}
+                                />
+                              ) : (
+                                <span
+                                  className="text-brand-500 text-2xl font-black tabular-nums cursor-pointer hover:text-brand-700 transition-colors"
+                                  onClick={() => { setEditingReps(ex.id); setTempReps(String(ex.reps)); }}
+                                >
+                                  {ex.reps}
+                                </span>
+                              )}
                               <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Reps</span>
                             </div>
+                            {ex.weight && (
+                              <div className="flex flex-col items-center md:items-end">
+                                {editingWeight === ex.id ? (
+                                  <input
+                                    autoFocus
+                                    className="text-slate-600 text-sm font-bold bg-white border border-brand-200 rounded w-24 text-center outline-none focus:ring-2 focus:ring-brand-500"
+                                    value={tempWeight}
+                                    onChange={(e) => setTempWeight(e.target.value)}
+                                    onBlur={() => { if (tempWeight.trim()) handleUpdateExerciseWeight(selectedSession.id, ex.id, tempWeight.trim()); setEditingWeight(null); }}
+                                    onKeyDown={(e) => { if (e.key === 'Enter') { if (tempWeight.trim()) handleUpdateExerciseWeight(selectedSession.id, ex.id, tempWeight.trim()); setEditingWeight(null); }}}
+                                  />
+                                ) : (
+                                  <span
+                                    className="text-slate-600 text-sm font-bold cursor-pointer hover:text-brand-500 transition-colors"
+                                    onClick={() => { setEditingWeight(ex.id); setTempWeight(ex.weight || ''); }}
+                                  >
+                                    {ex.weight}
+                                  </span>
+                                )}
+                                <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Weight</span>
+                              </div>
+                            )}
                             <button 
                               onClick={() => playExerciseClip(ex)}
                               className="md:mt-4 text-[9px] font-black text-brand-500 uppercase tracking-widest border border-brand-200 px-3 py-1.5 rounded-xl hover:bg-brand-50 transition-colors"
@@ -1133,20 +1341,100 @@ const App: React.FC = () => {
                 <>
                   <div className="bg-slate-900 text-white rounded-[32px] p-8 shadow-xl border border-slate-800">
                     <h3 className="text-[10px] font-black text-brand-400 uppercase tracking-[0.3em] mb-4">Trainer Summary</h3>
-                    <p className="text-sm font-medium leading-relaxed italic text-slate-300">"{selectedSession.analysis.summary}"</p>
+                    {editingSummary ? (
+                      <textarea
+                        autoFocus
+                        className="w-full text-sm font-medium leading-relaxed italic text-slate-300 bg-slate-800 border border-brand-500/30 rounded-xl p-3 outline-none focus:ring-2 focus:ring-brand-500 resize-y min-h-[80px]"
+                        value={tempSummary}
+                        onChange={(e) => setTempSummary(e.target.value)}
+                        onBlur={() => {
+                          if (tempSummary.trim()) handleUpdateSummary(selectedSession.id, tempSummary.trim());
+                          setEditingSummary(false);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
+                            if (tempSummary.trim()) handleUpdateSummary(selectedSession.id, tempSummary.trim());
+                            setEditingSummary(false);
+                          }
+                        }}
+                      />
+                    ) : (
+                      <p
+                        className="text-sm font-medium leading-relaxed italic text-slate-300 cursor-pointer hover:text-white transition-colors"
+                        onClick={() => { setEditingSummary(true); setTempSummary(selectedSession.analysis!.summary); }}
+                      >
+                        "{selectedSession.analysis.summary}"
+                      </p>
+                    )}
                   </div>
 
                   <div className="bg-white rounded-[32px] p-8 border border-slate-200 shadow-sm">
                     <h3 className="text-[10px] font-black text-slate-900 uppercase tracking-widest mb-6 border-b border-slate-50 pb-4">Coaching Directives</h3>
                     <div className="space-y-6">
                       {selectedSession.analysis.trainerCues.map((cue, i) => (
-                        <div key={i} className="flex gap-4 items-start">
+                        <div key={i} className="flex gap-4 items-start group/directive">
                           <div className="w-6 h-6 bg-brand-50 rounded-lg flex items-center justify-center text-brand-500 text-[10px] font-black flex-shrink-0">{i+1}</div>
-                          <p className="text-xs text-slate-600 font-semibold leading-relaxed">{cue}</p>
+                          {editingTrainerCueIdx === i ? (
+                            <input
+                              autoFocus
+                              className="flex-1 text-xs text-slate-600 font-semibold bg-white border border-brand-200 rounded px-2 py-1 outline-none focus:ring-2 focus:ring-brand-500"
+                              value={tempTrainerCue}
+                              onChange={(e) => setTempTrainerCue(e.target.value)}
+                              onBlur={() => { if (tempTrainerCue.trim()) handleUpdateTrainerCue(selectedSession.id, i, tempTrainerCue.trim()); setEditingTrainerCueIdx(null); }}
+                              onKeyDown={(e) => { if (e.key === 'Enter') { if (tempTrainerCue.trim()) handleUpdateTrainerCue(selectedSession.id, i, tempTrainerCue.trim()); setEditingTrainerCueIdx(null); }}}
+                            />
+                          ) : (
+                            <p
+                              className="text-xs text-slate-600 font-semibold leading-relaxed cursor-pointer hover:text-brand-500 transition-colors flex-1"
+                              onClick={() => { setEditingTrainerCueIdx(i); setTempTrainerCue(cue); }}
+                            >
+                              {cue}
+                            </p>
+                          )}
+                          <button
+                            onClick={() => handleRemoveTrainerCue(selectedSession.id, i)}
+                            className="opacity-0 group-hover/directive:opacity-100 text-slate-300 hover:text-red-400 transition-all shrink-0"
+                            title="Remove directive"
+                          >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                          </button>
                         </div>
                       ))}
+                      <button
+                        onClick={() => handleAddTrainerCue(selectedSession.id)}
+                        className="text-[9px] font-black text-brand-400 uppercase tracking-widest hover:text-brand-600 transition-colors"
+                      >
+                        + Add Directive
+                      </button>
                     </div>
                   </div>
+
+                  {/* Protocol Recommendations */}
+                  {selectedSession.analysis.protocolRecommendations && (
+                    <div className="bg-white rounded-[32px] p-8 border border-slate-200 shadow-sm">
+                      <h3 className="text-[10px] font-black text-slate-900 uppercase tracking-widest mb-6 border-b border-slate-50 pb-4">Protocol Recommendations</h3>
+                      {editingProtocol ? (
+                        <textarea
+                          autoFocus
+                          className="w-full text-xs text-slate-600 font-medium leading-relaxed bg-white border border-brand-200 rounded-xl p-4 outline-none focus:ring-2 focus:ring-brand-500 resize-y min-h-[100px]"
+                          value={tempProtocol}
+                          onChange={(e) => setTempProtocol(e.target.value)}
+                          onBlur={() => {
+                            if (tempProtocol.trim()) handleUpdateProtocol(selectedSession.id, tempProtocol.trim());
+                            setEditingProtocol(false);
+                          }}
+                        />
+                      ) : (
+                        <p
+                          className="text-xs text-slate-600 font-medium leading-relaxed cursor-pointer hover:text-brand-500 transition-colors"
+                          onClick={() => { setEditingProtocol(true); setTempProtocol(selectedSession.analysis!.protocolRecommendations); }}
+                        >
+                          {selectedSession.analysis.protocolRecommendations}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
             </div>

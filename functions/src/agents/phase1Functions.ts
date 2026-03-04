@@ -2,7 +2,7 @@
  * Best Day AI — Phase 1: Cloud Functions (Hybrid Architecture)
  *
  * Gemini watches video → REP_COUNTER produces Exercise Index
- * Claude thinks about data → CONSENSUS + REPORT (Phase 2+)
+ * Specialists run → REPORT_GENERATOR synthesizes + produces final report
  *
  * Pipeline:
  *   Video → GCS → onVideoUploadedDeepAnalysis → analysisJob created
@@ -16,9 +16,9 @@ import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
 import { RepCounterAgent } from './repCounterAgent';
 import type { ExerciseIndex } from './repCounterAgent';
-import { runPtExpert, runScCoach } from './specialistAgents';
+import { runPtExpert } from './specialistAgents';
 import { runAudioAnalyst } from './audioAnalystAgent';
-import { runConsensus, runReportGenerator } from './claudeAgents';
+import { runReportGenerator } from './claudeAgents';
 
 // ── 1. GCS Trigger: Create analysis job on video upload ─────────────────
 
@@ -276,7 +276,7 @@ export const getExerciseIndex = functions
 
 /**
  * Fires when a job transitions to 'rep_counter_complete'.
- * Runs all Phase 2 agents (PT_EXPERT, SC_COACH, AUDIO_ANALYST, CONSENSUS, REPORT).
+ * Runs Phase 2 agents: [PT_EXPERT, AUDIO_ANALYST] in parallel → REPORT_GENERATOR.
  *
  * Memory: 2GB — shared video buffer is held in-process for PT_EXPERT + AUDIO_ANALYST.
  * Timeout: 540s — sufficient for 60-min sessions (agents run in parallel).
@@ -308,10 +308,9 @@ export const onRepCounterComplete = functions
   });
 
 /**
- * Downloads video from GCS once, then runs all specialists in parallel.
+ * Downloads video from GCS once, then runs specialists in parallel.
  * PT_EXPERT and AUDIO_ANALYST share the base64 buffer (no double-download).
- * SC_COACH runs text-only in parallel.
- * Then runs Claude CONSENSUS and REPORT_GENERATOR sequentially.
+ * Then runs REPORT_GENERATOR (Claude Sonnet) which synthesizes specialist outputs.
  */
 async function dispatchSpecialists(
   jobId: string,
@@ -345,37 +344,21 @@ async function dispatchSpecialists(
   const videoMimeType = job.videoPath.endsWith('.mp4') ? 'video/mp4' : 'video/webm';
   console.log(`[Phase2] Video downloaded — ${(buffer.length / 1024 / 1024).toFixed(1)}MB`);
 
-  // ── Run all three specialists in parallel ─────────────────────────────────
+  // ── Run specialists in parallel ─────────────────────────────────────────────
   const specialistResults = await Promise.allSettled([
     runPtExpert(jobId, videoBase64, videoMimeType, job.exerciseIndex),
     runAudioAnalyst(jobId, videoBase64, videoMimeType, job.exerciseIndex),
-    runScCoach(jobId, job.exerciseIndex),
   ]);
 
-  // Log any specialist failures (they don't block consensus — graceful degradation)
+  // Log any specialist failures (they don't block report — graceful degradation)
   specialistResults.forEach((result, i) => {
-    const names = ['PT_EXPERT', 'AUDIO_ANALYST', 'SC_COACH'];
+    const names = ['PT_EXPERT', 'AUDIO_ANALYST'];
     if (result.status === 'rejected') {
       console.warn(`[Phase2] ${names[i]} rejected (non-blocking):`, result.reason);
     }
   });
 
-  // ── CONSENSUS ─────────────────────────────────────────────────────────────
-  await jobRef.update({
-    status: 'consensus_running',
-    updatedAt: admin.firestore.Timestamp.now(),
-  });
-  await db
-    .collection('trainers').doc(job.trainerId)
-    .collection('sessions').doc(job.sessionId)
-    .update({
-      analysisStatus: 'consensus_running',
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-  await runConsensus(jobId);
-
-  // ── REPORT_GENERATOR ──────────────────────────────────────────────────────
+  // ── REPORT_GENERATOR (synthesizes specialist outputs + generates report) ───
   await jobRef.update({
     status: 'report_generating',
     updatedAt: admin.firestore.Timestamp.now(),

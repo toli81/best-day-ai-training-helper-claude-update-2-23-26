@@ -4,6 +4,7 @@ import * as admin from 'firebase-admin';
 interface RequestData {
   sessionId: string;
   exerciseId: string;
+  thumbnailBase64?: string;
 }
 
 /** Tokenize text into lowercase search terms including partial prefixes */
@@ -88,6 +89,7 @@ export const addToLibrary = functions.https.onCall(async (data: RequestData, con
     clipPath: null,
     clipUrl: null,
     videoPath: session.videoPath || null,
+    thumbnailBase64: data.thumbnailBase64 || null,
     addedAt: admin.firestore.FieldValue.serverTimestamp(),
     addedBy: uid,
     searchTerms,

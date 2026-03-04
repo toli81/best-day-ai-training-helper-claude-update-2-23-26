@@ -19,7 +19,6 @@ export type AnalysisJobStatus =
   | 'rep_counter_running'
   | 'rep_counter_complete'
   | 'specialists_running'   // Phase 2
-  | 'consensus_running'     // Phase 2
   | 'report_generating'     // Phase 2
   | 'draft_ready'           // Phase 2
   | 'reviewed'              // Phase 3
@@ -169,7 +168,6 @@ export function getStatusLabel(status: AnalysisJobStatus): string {
     rep_counter_running: 'Indexing exercises...',
     rep_counter_complete: 'Exercise index ready',
     specialists_running: 'Specialists analyzing...',
-    consensus_running: 'Building consensus...',
     report_generating: 'Generating report...',
     draft_ready: 'Report ready for review',
     reviewed: 'Review complete',
@@ -183,9 +181,8 @@ export function getStatusProgress(status: AnalysisJobStatus): number {
     pending: 0,
     rep_counter_running: 20,
     rep_counter_complete: 40,
-    specialists_running: 60,
-    consensus_running: 75,
-    report_generating: 90,
+    specialists_running: 65,
+    report_generating: 85,
     draft_ready: 100,
     reviewed: 100,
     failed: 0,

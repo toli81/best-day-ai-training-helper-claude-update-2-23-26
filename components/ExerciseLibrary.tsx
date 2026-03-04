@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { TrainingSession, Exercise, LibraryExercise } from '../types';
-import { subscribeLibrary, addExerciseToLibrary } from '../services/exerciseLibraryService';
+import { subscribeLibrary, addExerciseToLibrary, captureVideoFrame } from '../services/exerciseLibraryService';
 
 type LibraryTab = 'my-exercises' | 'shared-library';
 
@@ -39,6 +39,10 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
   const [sharedLoading, setSharedLoading] = useState(true);
   const [sharingId, setSharingId] = useState<string | null>(null);
   const [shareSuccess, setShareSuccess] = useState<Record<string, boolean>>({});
+
+  // Clip playback modal
+  const [activeClip, setActiveClip] = useState<{ videoUrl: string; startTime: number; endTime: number; name: string } | null>(null);
+  const clipVideoRef = React.useRef<HTMLVideoElement>(null);
 
   // Subscribe to shared library when tab is active
   useEffect(() => {
@@ -119,7 +123,19 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
   const handleShareToLibrary = useCallback(async (sessionId: string, exerciseId: string) => {
     setSharingId(exerciseId);
     try {
-      const result = await addExerciseToLibrary(sessionId, exerciseId);
+      // Try to capture thumbnail from session video
+      let thumbnail: string | undefined;
+      const session = sessions.find(s => s.id === sessionId);
+      const exercise = session?.analysis?.exercises?.find(e => e.id === exerciseId);
+      if (session?.videoUrl && exercise) {
+        try {
+          thumbnail = await captureVideoFrame(session.videoUrl, exercise.startTime + 1);
+        } catch (e) {
+          console.warn('Thumbnail capture failed, sharing without thumbnail:', e);
+        }
+      }
+
+      const result = await addExerciseToLibrary(sessionId, exerciseId, thumbnail);
       setShareSuccess(prev => ({ ...prev, [exerciseId]: true }));
       if (result.alreadyExists) {
         alert('This exercise is already in the shared library!');
@@ -130,7 +146,38 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
     } finally {
       setSharingId(null);
     }
+  }, [sessions]);
+
+  // --- Clip playback ---
+  const handlePlayClip = useCallback((videoUrl: string, startTime: number, endTime: number, name: string) => {
+    setActiveClip({ videoUrl, startTime, endTime, name });
   }, []);
+
+  // Pause clip at endTime
+  useEffect(() => {
+    if (!activeClip || !clipVideoRef.current) return;
+    const video = clipVideoRef.current;
+    const handleTime = () => {
+      if (video.currentTime >= activeClip.endTime) {
+        video.pause();
+      }
+    };
+    video.addEventListener('timeupdate', handleTime);
+    return () => video.removeEventListener('timeupdate', handleTime);
+  }, [activeClip]);
+
+  // Seek to start when clip opens
+  useEffect(() => {
+    if (!activeClip || !clipVideoRef.current) return;
+    const video = clipVideoRef.current;
+    const handleLoaded = () => {
+      video.currentTime = activeClip.startTime;
+      video.play().catch(() => {});
+    };
+    video.addEventListener('loadedmetadata', handleLoaded);
+    if (video.readyState >= 1) handleLoaded();
+    return () => video.removeEventListener('loadedmetadata', handleLoaded);
+  }, [activeClip]);
 
   const activeTags = tab === 'shared-library' ? sharedTags : uniqueTags;
 
@@ -308,7 +355,7 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
                       className="text-[10px] font-black text-brand-500 hover:text-brand-600 uppercase tracking-widest">Add</button>
                   </div>
                 </div>
-                <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
+                <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between gap-2">
                   <button onClick={() => onViewExercise(ex.sessionId, ex)}
                     className="text-[10px] font-black text-brand-500 uppercase tracking-widest hover:underline flex items-center gap-2">
                     View in Session
@@ -316,6 +363,20 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M14 5l7 7m0 0l-7 7m7-7H3" />
                     </svg>
                   </button>
+                  {(() => {
+                    const session = sessions.find(s => s.id === ex.sessionId);
+                    return session?.videoUrl ? (
+                      <button
+                        onClick={() => handlePlayClip(session.videoUrl!, ex.startTime, ex.endTime, ex.name)}
+                        className="text-[9px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:text-brand-500 hover:bg-brand-50 transition-all"
+                      >
+                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+                        </svg>
+                        Play Clip
+                      </button>
+                    ) : null;
+                  })()}
                   <button
                     onClick={() => handleShareToLibrary(ex.sessionId, ex.id)}
                     disabled={sharingId === ex.id || shareSuccess[ex.id]}
@@ -357,6 +418,25 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
                 {filteredShared.map(ex => (
                   <div key={ex.id} className="group bg-white border border-slate-200 rounded-[32px] overflow-hidden hover:border-brand-200 hover:shadow-2xl transition-all duration-500 flex flex-col">
+                    {/* Thumbnail */}
+                    {ex.thumbnailBase64 ? (
+                      <div className="relative aspect-video bg-slate-900 cursor-pointer" onClick={() => ex.videoPath && handlePlayClip(ex.videoPath, ex.startTime, ex.endTime, ex.name)}>
+                        <img src={`data:image/jpeg;base64,${ex.thumbnailBase64}`} alt={ex.name} className="w-full h-full object-cover" />
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <div className="w-12 h-12 bg-white/90 rounded-full flex items-center justify-center shadow-lg">
+                            <svg className="w-5 h-5 text-brand-500 ml-0.5" fill="currentColor" viewBox="0 0 20 20">
+                              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+                            </svg>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="aspect-video bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center">
+                        <svg className="w-10 h-10 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                      </div>
+                    )}
                     <div className="p-6 flex-grow space-y-4">
                       <div className="flex justify-between items-start">
                         <div className="flex-grow pr-4">
@@ -409,6 +489,34 @@ const ExerciseLibrary: React.FC<ExerciseLibraryProps> = ({
             </>
           )}
         </>
+      )}
+      {/* Clip Playback Modal */}
+      {activeClip && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={() => setActiveClip(null)}>
+          <div className="bg-white rounded-[32px] overflow-hidden shadow-2xl max-w-2xl w-full mx-4" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-4 border-b border-slate-100">
+              <h4 className="font-black text-slate-900 uppercase tracking-tight text-sm">{activeClip.name}</h4>
+              <button onClick={() => setActiveClip(null)} className="text-slate-400 hover:text-slate-600 transition-colors">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="aspect-video bg-black">
+              <video
+                ref={clipVideoRef}
+                src={activeClip.videoUrl}
+                controls
+                className="w-full h-full object-contain"
+              />
+            </div>
+            <div className="p-4 text-center">
+              <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                Clip: {Math.round(activeClip.startTime)}s — {Math.round(activeClip.endTime)}s ({Math.round(activeClip.endTime - activeClip.startTime)}s)
+              </span>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

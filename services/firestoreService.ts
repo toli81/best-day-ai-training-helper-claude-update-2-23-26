@@ -47,16 +47,24 @@ export async function deleteSession(trainerId: string, sessionId: string): Promi
 
 export function subscribeSessions(
   trainerId: string,
-  callback: (sessions: TrainingSession[]) => void
+  callback: (sessions: TrainingSession[]) => void,
+  onError?: (error: Error) => void,
 ): Unsubscribe {
   const q = query(sessionsRef(trainerId), orderBy('date', 'desc'));
-  return onSnapshot(q, (snapshot) => {
-    const sessions = snapshot.docs.map((d) => ({
-      ...d.data(),
-      id: d.id,
-    })) as TrainingSession[];
-    callback(sessions);
-  });
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const sessions = snapshot.docs.map((d) => ({
+        ...d.data(),
+        id: d.id,
+      })) as TrainingSession[];
+      callback(sessions);
+    },
+    (error) => {
+      console.error('[Firestore] subscribeSessions error:', error);
+      if (onError) onError(error);
+    },
+  );
 }
 
 // --- Clients ---

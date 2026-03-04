@@ -207,7 +207,7 @@ export class RepCounterAgent {
   private storage: admin.storage.Storage;
   private model: string;
 
-  constructor(model = 'gemini-2.5-flash') {
+  constructor(model = 'gemini-2.5-pro') {
     const apiKey = functions.config().gemini?.api_key || process.env.GEMINI_API_KEY;
     if (!apiKey) {
       throw new Error('Missing GEMINI_API_KEY — this should already be set for your existing Gemini functions');

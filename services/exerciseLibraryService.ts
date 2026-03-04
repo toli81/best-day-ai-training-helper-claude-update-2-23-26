@@ -81,18 +81,73 @@ export function subscribeLibrary(
   });
 }
 
+// --- Thumbnail capture ---
+
+/**
+ * Capture a single video frame as a base64 JPEG thumbnail.
+ * Creates a hidden video element, seeks to the given time, and draws to canvas.
+ */
+export function captureVideoFrame(videoUrl: string, timeSeconds: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.crossOrigin = 'anonymous';
+    video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
+
+    const cleanup = () => {
+      video.removeAttribute('src');
+      video.load();
+    };
+
+    video.addEventListener('error', () => {
+      cleanup();
+      reject(new Error('Failed to load video for thumbnail'));
+    });
+
+    video.addEventListener('loadedmetadata', () => {
+      const seekTo = Math.min(timeSeconds, video.duration - 0.1);
+      video.currentTime = Math.max(0, seekTo);
+    });
+
+    video.addEventListener('seeked', () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 320;
+        canvas.height = 180;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { cleanup(); reject(new Error('Canvas context failed')); return; }
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+        const base64 = dataUrl.split(',')[1];
+        cleanup();
+        resolve(base64);
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
+    });
+
+    // Timeout safety
+    setTimeout(() => { cleanup(); reject(new Error('Thumbnail capture timed out')); }, 10000);
+
+    video.src = videoUrl;
+  });
+}
+
 // --- Add to library ---
 
 interface AddToLibraryResult { id: string; alreadyExists: boolean }
 
 export async function addExerciseToLibrary(
   sessionId: string,
-  exerciseId: string
+  exerciseId: string,
+  thumbnailBase64?: string
 ): Promise<AddToLibraryResult> {
-  const fn = httpsCallable<{ sessionId: string; exerciseId: string }, AddToLibraryResult>(
+  const fn = httpsCallable<{ sessionId: string; exerciseId: string; thumbnailBase64?: string }, AddToLibraryResult>(
     functions, 'addToLibrary'
   );
-  const result = await fn({ sessionId, exerciseId });
+  const result = await fn({ sessionId, exerciseId, thumbnailBase64 });
   return result.data;
 }
 

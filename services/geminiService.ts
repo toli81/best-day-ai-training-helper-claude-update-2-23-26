@@ -13,7 +13,7 @@ function getAI(): GoogleGenAI {
   return _ai;
 }
 
-const FLASH_MODEL = 'gemini-2.5-flash';
+const FLASH_MODEL = 'gemini-2.5-pro';
 
 // Define schema before usage in functions
 const SESSION_SCHEMA = {

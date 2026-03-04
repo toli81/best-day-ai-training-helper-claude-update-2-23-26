@@ -149,7 +149,7 @@ export async function runAudioAnalyst(
   if (!apiKey) throw new Error('Missing GEMINI_API_KEY');
 
   const ai = new GoogleGenAI({ apiKey });
-  const model = 'gemini-2.5-flash';
+  const model = 'gemini-2.5-pro';
 
   console.log(`[AUDIO_ANALYST] Starting for job ${jobId}`);
 

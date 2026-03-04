@@ -6,7 +6,6 @@ export type AnalysisJobStatus =
   | 'rep_counter_running'
   | 'rep_counter_complete'
   | 'specialists_running'
-  | 'consensus_running'
   | 'report_generating'
   | 'draft_ready'
   | 'reviewed'
@@ -51,6 +50,7 @@ export interface TrainingSession {
   videoUrl?: string;
   videoBlob?: Blob;
   analysis?: SessionAnalysis;
+  originalAnalysis?: SessionAnalysis;
   tags: string[];
   snapshotCount?: number;
   mode: SessionMode;
@@ -119,6 +119,7 @@ export interface LibraryExercise {
   addedAt: string;
   addedBy: string;
   searchTerms: string[];
+  thumbnailBase64: string | null;
 }
 
 export interface SyncTask {
